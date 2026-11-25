@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::config::Config;
 use crate::docs::split_path_and_line_range;
 use crate::model::{CheckKind, Diagnostic, Report, Severity};
 use crate::symbols::{PathLookup, RepoIndex, clean_rel_str};
@@ -14,6 +15,15 @@ use crate::verify::inspect_receipts;
 ///   references for types that exist in the repo
 /// - Verifies that any cited passing commands have fresh, non-stale passing receipts
 pub fn check_claims(index: &RepoIndex, claim_text: &str) -> Result<Report> {
+    check_claims_with_config(index, &Config::default(), claim_text)
+}
+
+/// Variant of [`check_claims`] applying `.ctxproof.toml` ignore and disable rules.
+pub fn check_claims_with_config(
+    index: &RepoIndex,
+    config: &Config,
+    claim_text: &str,
+) -> Result<Report> {
     let mut diagnostics = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -32,6 +42,7 @@ pub fn check_claims(index: &RepoIndex, claim_text: &str) -> Result<Report> {
     }
 
     check_claimed_receipts(index, claim_text, &mut diagnostics)?;
+    let diagnostics = config.filter_diagnostics(diagnostics);
 
     let errors = diagnostics
         .iter()
@@ -337,7 +348,16 @@ fn validate_repo_target(
 }
 
 fn parse_decl_ident(token: &str) -> Option<(&str, &str)> {
-    for kw in ["fn ", "struct ", "enum ", "trait ", "def ", "class "] {
+    for kw in [
+        "fn ",
+        "func ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "def ",
+        "class ",
+        "namespace ",
+    ] {
         if let Some(rest) = token.strip_prefix(kw) {
             let ident = rest
                 .split(['(', '<', '{', ':', ' '])

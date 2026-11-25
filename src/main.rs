@@ -4,11 +4,12 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use ctxproof::claims::check_claims;
-use ctxproof::diff::check_diff;
-use ctxproof::docs::check_docs;
+use ctxproof::claims::check_claims_with_config;
+use ctxproof::config::Config;
+use ctxproof::diff::check_diff_with_config;
+use ctxproof::docs::check_docs_with_config;
 use ctxproof::manifests::ProjectManifests;
-use ctxproof::mcp::{render_repo_map, serve_stdio};
+use ctxproof::mcp::{render_repo_map, render_symbol_slices, serve_stdio};
 use ctxproof::model::{CheckKind, Diagnostic, Report, Severity};
 use ctxproof::symbols::RepoIndex;
 use ctxproof::verify::{inspect_receipts, run_verified};
@@ -17,6 +18,7 @@ use ctxproof::verify::{inspect_receipts, run_verified};
 enum OutputFormat {
     Text,
     Json,
+    Sarif,
 }
 
 #[derive(Parser)]
@@ -40,8 +42,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Create a starter `.ctxproof.toml` configuration file in the repository root.
+    Init {
+        /// Overwrite an existing `.ctxproof.toml`.
+        #[arg(long)]
+        force: bool,
+    },
     /// Audit AGENTS.md, CLAUDE.md, GEMINI.md, SKILL.md, and README files for context rot.
-    Docs,
+    Docs {
+        /// Automatically update shifted `#L` line ranges whose link label matches a unique AST symbol.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Audit git diff + untracked files strictly on edited lines.
     Diff,
     /// Run a check command, distill logs, and write a tree-fingerprint freshness receipt.
@@ -63,12 +75,18 @@ enum Commands {
     Check,
     /// Show recorded verification receipts and whether each is fresh or stale.
     Status,
-    /// Print a token-compact AST symbol map for the repository.
+    /// Print a token-compact AST symbol map or exact source slice for a named symbol.
     Map {
         /// Optional path or symbol substring filter.
         #[arg(long)]
         filter: Option<String>,
-        /// Maximum number of symbol entries to print.
+        /// Optional exact symbol name (or `Type::method`) to look up.
+        #[arg(long)]
+        symbol: Option<String>,
+        /// Print numbered source lines for `--symbol` instead of the outline.
+        #[arg(long, requires = "symbol")]
+        source: bool,
+        /// Maximum number of entries or symbol matches to print.
         #[arg(long, default_value_t = 120)]
         max_entries: usize,
     },
@@ -90,14 +108,30 @@ fn main() -> ExitCode {
 fn run() -> Result<bool> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Docs => {
+        Commands::Init { force } => {
+            if Config::write_starter(&cli.root, force)? {
+                println!(
+                    "Created `{}`.\n\nTo add ctxproof as an MCP server:\n{{\n  \"mcpServers\": {{\n    \"ctxproof\": {{ \"command\": \"ctxproof\", \"args\": [\"mcp\"] }}\n  }}\n}}",
+                    cli.root.join(".ctxproof.toml").display()
+                );
+            } else {
+                println!(
+                    "`{}` already exists (pass `--force` to overwrite).",
+                    cli.root.join(".ctxproof.toml").display()
+                );
+            }
+            Ok(true)
+        }
+        Commands::Docs { fix } => {
+            let config = Config::load(&cli.root)?;
             let index = RepoIndex::build(&cli.root)?;
             let manifests = ProjectManifests::discover(&index);
-            let report = check_docs(&index, &manifests);
+            let report = check_docs_with_config(&index, &manifests, &config, fix);
             emit_report(&report, cli.format)
         }
         Commands::Diff => {
-            let report = check_diff(&cli.root)?;
+            let config = Config::load(&cli.root)?;
+            let report = check_diff_with_config(&cli.root, &config)?;
             emit_report(&report, cli.format)
         }
         Commands::Verify { cmd } => {
@@ -118,6 +152,9 @@ fn run() -> Result<bool> {
                         }))?
                     );
                 }
+                OutputFormat::Sarif => {
+                    println!("{}", serde_json::to_string_pretty(&report.render_sarif())?);
+                }
             }
             Ok(report.ok)
         }
@@ -128,27 +165,29 @@ fn run() -> Result<bool> {
                 (None, Some(t)) => t,
                 _ => unreachable!(),
             };
+            let config = Config::load(&cli.root)?;
             let index = RepoIndex::build(&cli.root)?;
-            let report = check_claims(&index, &body)?;
+            let report = check_claims_with_config(&index, &config, &body)?;
             emit_report(&report, cli.format)
         }
         Commands::Check => {
+            let config = Config::load(&cli.root)?;
             let index = RepoIndex::build(&cli.root)?;
             let manifests = ProjectManifests::discover(&index);
             let mut diags = Vec::new();
-            let docs_report = check_docs(&index, &manifests);
+            let docs_report = check_docs_with_config(&index, &manifests, &config, false);
             diags.extend(docs_report.diagnostics);
 
             if index.root.join(".git").exists() {
-                let diff_report = check_diff(&index.root)?;
+                let diff_report = check_diff_with_config(&index.root, &config)?;
                 diags.extend(diff_report.diagnostics);
             }
 
             let receipts = inspect_receipts(&index.root)?;
-            let stale_count = receipts.iter().filter(|(_, fresh)| !*fresh).count();
+            let mut stale_diags = Vec::new();
             for (r, fresh) in receipts {
                 if !fresh {
-                    diags.push(Diagnostic::new(
+                    stale_diags.push(Diagnostic::new(
                         Severity::Warning,
                         CheckKind::StaleReceipt,
                         None,
@@ -160,6 +199,9 @@ fn run() -> Result<bool> {
                     ));
                 }
             }
+            let stale_diags = config.filter_diagnostics(stale_diags);
+            let stale_count = stale_diags.len();
+            diags.extend(stale_diags);
 
             let errors = diags
                 .iter()
@@ -193,7 +235,7 @@ fn run() -> Result<bool> {
                         }
                     }
                 }
-                OutputFormat::Json => {
+                OutputFormat::Json | OutputFormat::Sarif => {
                     let items: Vec<_> = receipts
                         .into_iter()
                         .map(|(receipt, fresh)| {
@@ -207,10 +249,21 @@ fn run() -> Result<bool> {
         }
         Commands::Map {
             filter,
+            symbol,
+            source,
             max_entries,
         } => {
-            let map = render_repo_map(&cli.root, filter.as_deref(), max_entries)?;
-            print!("{map}");
+            if let Some(ref sym) = symbol
+                && source
+            {
+                let out =
+                    render_symbol_slices(&cli.root, sym, filter.as_deref(), max_entries.min(10))?;
+                print!("{out}");
+            } else {
+                let eff_filter = symbol.or(filter);
+                let map = render_repo_map(&cli.root, eff_filter.as_deref(), max_entries)?;
+                print!("{map}");
+            }
             Ok(true)
         }
         Commands::Mcp => {
@@ -224,6 +277,9 @@ fn emit_report(report: &Report, format: OutputFormat) -> Result<bool> {
     match format {
         OutputFormat::Text => print!("{}", report.render_text()),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(report)?),
+        OutputFormat::Sarif => {
+            println!("{}", serde_json::to_string_pretty(&report.render_sarif())?)
+        }
     }
     Ok(report.ok)
 }

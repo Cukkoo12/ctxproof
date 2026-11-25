@@ -5,6 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+use crate::config::Config;
 use crate::model::{CheckKind, Diagnostic, Report, Severity};
 
 /// Parsed hunk edits and untracked additions from Git.
@@ -15,11 +16,17 @@ pub struct DiffSummary {
     pub untracked_files: BTreeSet<String>,
 }
 
-/// Checks `git diff` + untracked files strictly on changed/new lines:
-/// - Diff-scoped `rustfmt --check` (ignores untouched pre-existing formatting drift)
-/// - Leftover debug calls (`dbg!`, `console.log`, `breakpoint()`, etc.)
+/// Checks `git diff` + untracked files strictly on changed/new lines using `.ctxproof.toml`:
+/// - Diff-scoped `rustfmt --check` and `ruff format --diff`
+/// - Leftover debug calls (`dbg!`, `console.log`, `breakpoint()`, etc.) on source files
 /// - Secret/token patterns
 pub fn check_diff(root: &Path) -> Result<Report> {
+    let config = Config::load(root)?;
+    check_diff_with_config(root, &config)
+}
+
+/// Variant of [`check_diff`] accepting an explicit [`Config`].
+pub fn check_diff_with_config(root: &Path, config: &Config) -> Result<Report> {
     let summary = collect_git_changes(root)?;
     let mut diagnostics = Vec::new();
 
@@ -33,8 +40,28 @@ pub fn check_diff(root: &Path) -> Result<Report> {
     }
 
     scan_added_lines(&summary, &mut diagnostics);
-    let skipped_untouched = check_rustfmt_on_changed(root, &summary, &mut diagnostics);
+    let mut skipped_untouched = 0usize;
+    let mut unavailable = Vec::new();
 
+    if config.formatters.rustfmt {
+        match check_rustfmt_on_changed(
+            root,
+            config.rust_edition.as_deref(),
+            &summary,
+            &mut diagnostics,
+        ) {
+            Ok(n) => skipped_untouched += n,
+            Err(tool) => unavailable.push(tool),
+        }
+    }
+    if config.formatters.ruff {
+        match check_ruff_on_changed(root, &summary, &mut diagnostics) {
+            Ok(n) => skipped_untouched += n,
+            Err(tool) => unavailable.push(tool),
+        }
+    }
+
+    let diagnostics = config.filter_diagnostics(diagnostics);
     let errors = diagnostics
         .iter()
         .filter(|d| d.severity == Severity::Error)
@@ -49,12 +76,22 @@ pub fn check_diff(root: &Path) -> Result<Report> {
         .chain(summary.untracked_files.iter())
         .collect::<BTreeSet<_>>()
         .len();
-    let msg = if skipped_untouched > 0 {
-        format!(
-            "checked {touched_files} changed files ({errors} errors, {warnings} warnings; ignored {skipped_untouched} untouched rustfmt hunks)"
-        )
-    } else {
+    let mut notes = Vec::new();
+    if skipped_untouched > 0 {
+        notes.push(format!(
+            "ignored {skipped_untouched} untouched formatter hunks"
+        ));
+    }
+    if !unavailable.is_empty() {
+        notes.push(format!("unavailable: {}", unavailable.join(", ")));
+    }
+    let msg = if notes.is_empty() {
         format!("checked {touched_files} changed files ({errors} errors, {warnings} warnings)")
+    } else {
+        format!(
+            "checked {touched_files} changed files ({errors} errors, {warnings} warnings; {})",
+            notes.join("; ")
+        )
     };
 
     Ok(Report::from_diagnostics(
@@ -264,25 +301,33 @@ fn detect_secret_token(line: &str) -> Option<&'static str> {
     None
 }
 
-fn check_rustfmt_on_changed(
-    root: &Path,
-    summary: &DiffSummary,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> usize {
-    let rust_files: Vec<String> = summary
+fn collect_changed_by_ext(summary: &DiffSummary, ext: &str) -> Vec<String> {
+    summary
         .changed_ranges
         .keys()
         .chain(summary.untracked_files.iter())
-        .filter(|p| p.ends_with(".rs"))
+        .filter(|p| p.ends_with(ext))
         .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect();
+        .collect()
+}
+
+fn check_rustfmt_on_changed(
+    root: &Path,
+    edition_override: Option<&str>,
+    summary: &DiffSummary,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> std::result::Result<usize, &'static str> {
+    let rust_files = collect_changed_by_ext(summary, ".rs");
     if rust_files.is_empty() {
-        return 0;
+        return Ok(0);
     }
 
-    let edition = detect_rust_edition(root).unwrap_or_else(|| "2021".into());
+    let edition = edition_override
+        .map(ToOwned::to_owned)
+        .or_else(|| detect_rust_edition(root))
+        .unwrap_or_else(|| "2021".into());
     let mut cmd = Command::new("rustfmt");
     cmd.arg("--edition")
         .arg(&edition)
@@ -291,17 +336,69 @@ fn check_rustfmt_on_changed(
     for rel in &rust_files {
         cmd.arg(rel);
     }
-    let Ok(output) = cmd.output() else {
-        return 0;
-    };
+    let output = cmd.output().map_err(|_| "rustfmt")?;
     if output.status.success() {
-        return 0;
+        return Ok(0);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stdout.trim().is_empty() && stderr.contains("not installed") {
+        return Err("rustfmt");
+    }
     let hunks = parse_rustfmt_diffs(&stdout, root);
-    let mut untouched_skipped = 0usize;
+    let hint = format!("run `rustfmt --edition {edition} <file>` or format only edited lines");
+    Ok(filter_formatter_hunks(
+        "rustfmt",
+        hunks,
+        summary,
+        &hint,
+        diagnostics,
+    ))
+}
 
+fn check_ruff_on_changed(
+    root: &Path,
+    summary: &DiffSummary,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> std::result::Result<usize, &'static str> {
+    let py_files = collect_changed_by_ext(summary, ".py");
+    if py_files.is_empty() {
+        return Ok(0);
+    }
+
+    let mut cmd = Command::new("ruff");
+    cmd.args(["format", "--diff"]).current_dir(root);
+    for rel in &py_files {
+        cmd.arg(rel);
+    }
+    let output = cmd.output().map_err(|_| "ruff")?;
+    if output.status.success() {
+        return Ok(0);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return Err("ruff");
+    }
+    let hunks = parse_unified_formatter_hunks(&stdout, root);
+    Ok(filter_formatter_hunks(
+        "ruff format",
+        hunks,
+        summary,
+        "format edited Python lines cleanly without touching unrelated code",
+        diagnostics,
+    ))
+}
+
+fn filter_formatter_hunks(
+    tool: &str,
+    hunks: Vec<(String, usize, usize)>,
+    summary: &DiffSummary,
+    hint: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> usize {
+    let mut untouched_skipped = 0usize;
     for (file_rel, start_line, end_line) in hunks {
         if summary.untracked_files.contains(&file_rel) {
             diagnostics.push(
@@ -310,9 +407,9 @@ fn check_rustfmt_on_changed(
                     CheckKind::DiffFormatting,
                     Some(PathBuf::from(&file_rel)),
                     Some(start_line),
-                    format!("rustfmt differs in new file at lines {start_line}-{end_line}"),
+                    format!("{tool} differs in new file at lines {start_line}-{end_line}"),
                 )
-                .with_suggestion(format!("run `rustfmt --edition {edition} {file_rel}`")),
+                .with_suggestion(hint),
             );
             continue;
         }
@@ -329,17 +426,54 @@ fn check_rustfmt_on_changed(
                     Some(PathBuf::from(&file_rel)),
                     Some(start_line),
                     format!(
-                        "rustfmt differs inside changed hunk around lines {start_line}-{end_line}"
+                        "{tool} differs inside changed hunk around lines {start_line}-{end_line}"
                     ),
                 )
-                .with_suggestion("format the edited lines cleanly without touching unrelated code"),
+                .with_suggestion(hint),
             );
         } else {
             untouched_skipped += 1;
         }
     }
-
     untouched_skipped
+}
+
+/// Parses standard unified diff (`---`/`+++`/`@@ -start,count +... @@`) hunks from `ruff format --diff`.
+pub fn parse_unified_formatter_hunks(stdout: &str, root: &Path) -> Vec<(String, usize, usize)> {
+    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut hunks = Vec::new();
+    let mut current_file: Option<String> = None;
+
+    for raw in stdout.lines() {
+        let stripped = strip_ansi(raw);
+        let line = stripped.as_str();
+        if let Some(path_part) = line.strip_prefix("--- ") {
+            let trimmed = path_part.split('\t').next().unwrap_or(path_part).trim();
+            if trimmed != "/dev/null" {
+                let rel_raw = trimmed.strip_prefix("a/").unwrap_or(trimmed);
+                current_file = Some(make_relative_norm(rel_raw, root, &canon_root));
+            }
+            continue;
+        }
+        if line.starts_with("@@ ")
+            && let Some(file) = &current_file
+            && let Some((start, count)) = parse_old_hunk_span(line)
+        {
+            let end = start + count.saturating_sub(1);
+            hunks.push((file.clone(), start.max(1), end.max(start.max(1))));
+        }
+    }
+    hunks
+}
+
+fn parse_old_hunk_span(header: &str) -> Option<(usize, usize)> {
+    let minus = header.split_once(" -")?.1;
+    let span = minus.split_whitespace().next()?;
+    if let Some((start_s, count_s)) = span.split_once(',') {
+        Some((start_s.parse().ok()?, count_s.parse().ok()?))
+    } else {
+        Some((span.parse().ok()?, 1))
+    }
 }
 
 fn detect_rust_edition(root: &Path) -> Option<String> {
@@ -552,9 +686,16 @@ mod tests {
         let report = check_diff(root).unwrap();
         assert!(report.ok, "{}", report.render_text());
         assert!(
-            report.summary.contains("ignored 1 untouched rustfmt hunks"),
+            report
+                .summary
+                .contains("ignored 1 untouched formatter hunks"),
             "{}",
             report.summary
         );
+
+        let ruff_diff =
+            "--- src/app.py\n+++ src/app.py\n@@ -12,3 +12,3 @@\n def f():\n-    x=1\n+    x = 1\n";
+        let py_hunks = parse_unified_formatter_hunks(ruff_diff, root);
+        assert_eq!(py_hunks, vec![("src/app.py".into(), 12, 14)]);
     }
 }

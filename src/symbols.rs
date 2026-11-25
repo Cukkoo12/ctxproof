@@ -15,6 +15,9 @@ pub enum Lang {
     TypeScript,
     Tsx,
     JavaScript,
+    Go,
+    C,
+    Cpp,
 }
 
 impl Lang {
@@ -28,6 +31,9 @@ impl Lang {
             "ts" | "mts" | "cts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
             "js" | "mjs" | "cjs" | "jsx" => Some(Self::JavaScript),
+            "go" => Some(Self::Go),
+            "c" | "h" => Some(Self::C),
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
             _ => None,
         }
     }
@@ -39,6 +45,9 @@ impl Lang {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Self::Go => tree_sitter_go::LANGUAGE.into(),
+            Self::C => tree_sitter_c::LANGUAGE.into(),
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         }
     }
 }
@@ -434,13 +443,35 @@ fn walk_node(
     if let Some((sym_kind, name_node, pushes_scope)) = classify_node(node, lang, src)
         && let Ok(name_text) = name_node.utf8_text(src)
     {
-        let name = name_text.trim().to_owned();
+        let clean_name = name_text.trim();
+        let name = if matches!(lang, Lang::C | Lang::Cpp) {
+            clean_name
+                .split("::")
+                .last()
+                .unwrap_or(clean_name)
+                .trim()
+                .to_owned()
+        } else {
+            clean_name.to_owned()
+        };
         if !name.is_empty() {
             let sep = match lang {
-                Lang::Rust => "::",
-                Lang::Python | Lang::TypeScript | Lang::Tsx | Lang::JavaScript => ".",
+                Lang::Rust | Lang::Cpp => "::",
+                Lang::Python
+                | Lang::TypeScript
+                | Lang::Tsx
+                | Lang::JavaScript
+                | Lang::Go
+                | Lang::C => ".",
             };
-            let qualified = if scope.is_empty() {
+            let qualified = if lang == Lang::Go
+                && kind == "method_declaration"
+                && let Some(recv) = go_receiver_type(node, src)
+            {
+                format!("{recv}.{name}")
+            } else if matches!(lang, Lang::Cpp) && clean_name.contains("::") && scope.is_empty() {
+                clean_name.to_owned()
+            } else if scope.is_empty() {
                 name.clone()
             } else {
                 format!("{}{sep}{name}", scope.join(sep))
@@ -550,7 +581,71 @@ fn classify_node<'a>(
             }
             _ => None,
         },
+        Lang::Go => match kind {
+            "function_declaration" => Some(("fn", node.child_by_field_name("name")?, false)),
+            "method_declaration" => Some(("method", node.child_by_field_name("name")?, false)),
+            "type_spec" => Some(("type", node.child_by_field_name("name")?, false)),
+            _ => None,
+        },
+        Lang::C | Lang::Cpp => match kind {
+            "function_definition" => {
+                let decl = node.child_by_field_name("declarator")?;
+                Some(("fn", c_declarator_name(decl)?, false))
+            }
+            "struct_specifier" if node.child_by_field_name("body").is_some() => {
+                Some(("struct", node.child_by_field_name("name")?, true))
+            }
+            "enum_specifier" if node.child_by_field_name("body").is_some() => {
+                Some(("enum", node.child_by_field_name("name")?, true))
+            }
+            "class_specifier" if node.child_by_field_name("body").is_some() => {
+                Some(("class", node.child_by_field_name("name")?, true))
+            }
+            "namespace_definition" => Some(("namespace", node.child_by_field_name("name")?, true)),
+            _ => None,
+        },
     }
+}
+
+fn c_declarator_name(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(inner) = node.child_by_field_name("declarator") {
+        node = inner;
+    }
+    Some(node)
+}
+
+fn go_receiver_type(method_node: Node<'_>, src: &[u8]) -> Option<String> {
+    let recv = method_node.child_by_field_name("receiver")?;
+    let raw = recv.utf8_text(src).ok()?;
+    let inner = raw.trim().trim_start_matches('(').trim_end_matches(')');
+    let last = inner.split_whitespace().last()?.trim_start_matches('*');
+    let base = last.split('[').next()?.trim();
+    (!base.is_empty()).then(|| base.to_owned())
+}
+
+/// Reads the exact numbered line slice for a symbol entry from disk.
+pub fn read_symbol_source(root: &Path, entry: &SymbolEntry) -> Result<String> {
+    let abs = root.join(&entry.file);
+    let text = std::fs::read_to_string(&abs)
+        .with_context(|| format!("reading symbol file {}", entry.file.display()))?;
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        out,
+        "// {} ({} {} L{}-L{})",
+        normalize_rel(&entry.file),
+        entry.kind,
+        entry.qualified,
+        entry.start_line,
+        entry.end_line
+    );
+    for (idx, line) in text.lines().enumerate() {
+        let ln = idx + 1;
+        if ln >= entry.start_line && ln <= entry.end_line {
+            let _ = writeln!(out, "{ln:>4}: {line}");
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -604,6 +699,54 @@ pub fn helper() {}
         );
         assert!(ts.iter().any(|s| s.name == "boot" && s.kind == "fn"));
         assert!(ts.iter().any(|s| s.name == "VERSION" && s.kind == "var"));
+    }
+
+    #[test]
+    fn extracts_go_c_and_cpp_symbols_and_reads_slice() {
+        let mut parser = Parser::new();
+
+        let go = extract_symbols(
+            &mut parser,
+            Lang::Go,
+            Path::new("server.go"),
+            "package main\ntype Server struct{}\nfunc (s *Server) Start() {}\nfunc Helper() {}\n",
+        );
+        assert!(go.iter().any(|s| s.name == "Server" && s.kind == "type"));
+        assert!(go.iter().any(|s| s.qualified == "Server.Start"));
+        assert!(go.iter().any(|s| s.name == "Helper" && s.kind == "fn"));
+
+        let c = extract_symbols(
+            &mut parser,
+            Lang::C,
+            Path::new("calc.c"),
+            "struct Point { int x; };\nint *alloc_buf(int n) { return 0; }\n",
+        );
+        assert!(c.iter().any(|s| s.name == "Point" && s.kind == "struct"));
+        assert!(c.iter().any(|s| s.name == "alloc_buf" && s.kind == "fn"));
+
+        let cpp = extract_symbols(
+            &mut parser,
+            Lang::Cpp,
+            Path::new("engine.cpp"),
+            "namespace core {\nclass Engine {\npublic:\n    void tick() {}\n};\n}\n",
+        );
+        assert!(cpp.iter().any(|s| s.qualified == "core::Engine"));
+        assert!(cpp.iter().any(|s| s.qualified == "core::Engine::tick"));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("server.go"),
+            "package main\nfunc Helper() {}\n",
+        )
+        .unwrap();
+        let sym = &go.iter().find(|s| s.name == "Helper").unwrap();
+        let helper_at_2 = SymbolEntry {
+            start_line: 2,
+            end_line: 2,
+            ..(*sym).clone()
+        };
+        let slice = read_symbol_source(dir.path(), &helper_at_2).unwrap();
+        assert!(slice.contains("   2: func Helper() {}"));
     }
 
     #[test]

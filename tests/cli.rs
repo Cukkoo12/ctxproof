@@ -100,7 +100,7 @@ fn end_to_end_docs_diff_verify_claims_and_mcp() {
     );
     let diff_stdout = String::from_utf8_lossy(&ok_diff.stdout);
     assert!(
-        diff_stdout.contains("ignored 1 untouched rustfmt hunks"),
+        diff_stdout.contains("ignored 1 untouched formatter hunks"),
         "unexpected diff stdout: {diff_stdout}"
     );
 
@@ -172,7 +172,65 @@ fn end_to_end_docs_diff_verify_claims_and_mcp() {
         .unwrap();
     assert_eq!(stale_claims.status.code(), Some(2));
 
-    // 4. Spawn real MCP stdio server and verify tools/list + repo_map.
+    // 4. Test SARIF output format on stale receipt claims check.
+    let sarif_out = Command::new(bin())
+        .args([
+            "--root",
+            &root.to_string_lossy(),
+            "--format",
+            "sarif",
+            "check-claims",
+            "--text",
+            cited,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(sarif_out.status.code(), Some(2));
+    let sarif_json: serde_json::Value = serde_json::from_slice(&sarif_out.stdout).unwrap();
+    assert_eq!(sarif_json["version"], "2.1.0");
+    assert!(
+        !sarif_json["runs"][0]["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // 5. Test `ctxproof init`, `ctxproof docs --fix`, and `ctxproof map --symbol added_fn --source`.
+    let init_out = Command::new(bin())
+        .args(["--root", &root.to_string_lossy(), "init"])
+        .output()
+        .unwrap();
+    assert!(init_out.status.success());
+    assert!(root.join(".ctxproof.toml").is_file());
+
+    std::fs::write(
+        root.join("AGENTS.md"),
+        "Entry: [`added_fn`](src/lib.rs#L1-L1).\n",
+    )
+    .unwrap();
+    let fix_docs = Command::new(bin())
+        .args(["--root", &root.to_string_lossy(), "docs", "--fix"])
+        .output()
+        .unwrap();
+    assert!(fix_docs.status.success());
+    let fixed_agents = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+    assert!(fixed_agents.contains("src/lib.rs#L3-L5"), "{fixed_agents}");
+
+    let slice_out = Command::new(bin())
+        .args([
+            "--root",
+            &root.to_string_lossy(),
+            "map",
+            "--symbol",
+            "added_fn",
+            "--source",
+        ])
+        .output()
+        .unwrap();
+    assert!(slice_out.status.success());
+    assert!(String::from_utf8_lossy(&slice_out.stdout).contains("pub fn added_fn()"));
+
+    // 6. Spawn real MCP stdio server and verify repo_map + read_symbol + receipt_status.
     let mut mcp = Command::new(bin())
         .args(["--root", &root.to_string_lossy(), "mcp"])
         .stdin(Stdio::piped())
@@ -191,9 +249,20 @@ fn end_to_end_docs_diff_verify_claims_and_mcp() {
             "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"repo_map\",\"arguments\":{{\"filter\":\"added_fn\"}}}}}}"
         )
         .unwrap();
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"read_symbol\",\"arguments\":{{\"symbol\":\"added_fn\"}}}}}}"
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{{\"name\":\"receipt_status\",\"arguments\":{{}}}}}}"
+        )
+        .unwrap();
     }
     let mcp_out = mcp.wait_with_output().unwrap();
     assert!(mcp_out.status.success());
     let stdout = String::from_utf8(mcp_out.stdout).unwrap();
     assert!(stdout.contains("added_fn"));
+    assert!(stdout.contains("STALE"));
 }

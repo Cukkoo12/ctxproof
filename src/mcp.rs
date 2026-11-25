@@ -6,13 +6,14 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::claims::check_claims;
+use crate::claims::check_claims_with_config;
+use crate::config::Config;
 use crate::diff::check_diff;
-use crate::docs::check_docs;
+use crate::docs::check_docs_with_config;
 use crate::manifests::ProjectManifests;
 use crate::model::Report;
-use crate::symbols::RepoIndex;
-use crate::verify::run_verified;
+use crate::symbols::{RepoIndex, read_symbol_source};
+use crate::verify::{inspect_receipts, run_verified};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -148,17 +149,18 @@ fn tool_schemas() -> Value {
     json!([
         {
             "name": "verify_docs",
-            "description": "Audit AGENTS.md, CLAUDE.md, GEMINI.md, SKILL.md, and README.md for missing file paths, out-of-range line links, invalid commands, missing AST symbols, and rule conflicts.",
+            "description": "Audit AGENTS.md, CLAUDE.md, GEMINI.md, SKILL.md, README.md, and docs/*.md for context rot, respecting .ctxproof.toml. Optionally fix shifted symbol line links.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "root": { "type": "string", "description": "Optional repository root path (defaults to server cwd)." }
+                    "root": { "type": "string", "description": "Optional repository root path (defaults to server cwd)." },
+                    "fix": { "type": "boolean", "description": "Update stale #L line links matching a unique AST symbol in the target file." }
                 }
             }
         },
         {
             "name": "verify_diff",
-            "description": "Audit uncommitted git diff and untracked files strictly on changed lines (diff-only rustfmt, debug prints, secret tokens).",
+            "description": "Audit uncommitted git diff and untracked files strictly on changed lines (diff-scoped rustfmt & ruff format, debug prints, secret tokens).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -196,13 +198,36 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "repo_map",
-            "description": "Return a compact AST symbol map (functions, structs, classes, line ranges) filtered by optional substring to save agent tokens.",
+            "description": "Return a compact AST symbol map (functions, structs, classes, line ranges across Rust/Python/TS/JS/Go/C/C++) to save agent tokens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "root": { "type": "string", "description": "Optional repository root path." },
                     "filter": { "type": "string", "description": "Optional path or symbol substring filter." },
                     "max_entries": { "type": "integer", "description": "Maximum symbols returned (default 120)." }
+                }
+            }
+        },
+        {
+            "name": "read_symbol",
+            "description": "Read only the exact AST line slice(s) for a named or qualified symbol instead of reading whole source files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "root": { "type": "string", "description": "Optional repository root path." },
+                    "symbol": { "type": "string", "description": "Symbol or qualified name, e.g. `Engine::start` or `extract_symbols`." },
+                    "file": { "type": "string", "description": "Optional relative file path filter." }
+                },
+                "required": ["symbol"]
+            }
+        },
+        {
+            "name": "receipt_status",
+            "description": "Inspect recorded verification receipts under .ctxproof/receipts.json and check whether each is still FRESH or STALE.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "root": { "type": "string", "description": "Optional repository root path." }
                 }
             }
         }
@@ -222,7 +247,10 @@ fn call_tool(default_root: &Path, id: Value, params: &Value) -> RpcResponse {
         .unwrap_or(default_root);
 
     let result = match name {
-        "verify_docs" => run_docs(root).map(format_report_payload),
+        "verify_docs" => {
+            let fix = args.get("fix").and_then(|v| v.as_bool()).unwrap_or(false);
+            run_docs(root, fix).map(format_report_payload)
+        }
         "verify_diff" => check_diff(root).map(format_report_payload),
         "run_verified" => {
             let cmd: Vec<String> = args
@@ -249,9 +277,11 @@ fn call_tool(default_root: &Path, id: Value, params: &Value) -> RpcResponse {
         }
         "check_claims" => {
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            RepoIndex::build(root)
-                .and_then(|idx| check_claims(&idx, text))
-                .map(format_report_payload)
+            Config::load(root).and_then(|cfg| {
+                RepoIndex::build(root)
+                    .and_then(|idx| check_claims_with_config(&idx, &cfg, text))
+                    .map(format_report_payload)
+            })
         }
         "repo_map" => {
             let filter = args.get("filter").and_then(|v| v.as_str());
@@ -267,6 +297,46 @@ fn call_tool(default_root: &Path, id: Value, params: &Value) -> RpcResponse {
                 })
             })
         }
+        "read_symbol" => {
+            let sym = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+            let file_hint = args.get("file").and_then(|v| v.as_str());
+            if sym.trim().is_empty() {
+                Err(anyhow::anyhow!("`symbol` must be non-empty"))
+            } else {
+                render_symbol_slices(root, sym, file_hint, 5).map(|text| {
+                    json!({
+                        "content": [{ "type": "text", "text": text }],
+                        "isError": false
+                    })
+                })
+            }
+        }
+        "receipt_status" => inspect_receipts(root).map(|items| {
+            let mut out = String::new();
+            if items.is_empty() {
+                out.push_str("No verification receipts recorded yet.\n");
+            } else {
+                for (r, fresh) in &items {
+                    let state = if *fresh { "FRESH" } else { "STALE" };
+                    let status = if r.ok { "PASS" } else { "FAIL" };
+                    let _ = writeln!(
+                        out,
+                        "[{state}][{status}] `{}` ({} ms)",
+                        r.command.join(" "),
+                        r.duration_ms
+                    );
+                }
+            }
+            let structured: Vec<_> = items
+                .into_iter()
+                .map(|(receipt, fresh)| json!({ "fresh": fresh, "receipt": receipt }))
+                .collect();
+            json!({
+                "content": [{ "type": "text", "text": out }],
+                "structuredContent": { "receipts": structured },
+                "isError": false
+            })
+        }),
         unknown => Err(anyhow::anyhow!("unknown tool `{unknown}`")),
     };
 
@@ -289,10 +359,11 @@ fn call_tool(default_root: &Path, id: Value, params: &Value) -> RpcResponse {
     }
 }
 
-fn run_docs(root: &Path) -> Result<Report> {
+fn run_docs(root: &Path, fix: bool) -> Result<Report> {
+    let config = Config::load(root)?;
     let index = RepoIndex::build(root)?;
     let manifests = ProjectManifests::discover(&index);
-    Ok(check_docs(&index, &manifests))
+    Ok(check_docs_with_config(&index, &manifests, &config, fix))
 }
 
 fn format_report_payload(report: Report) -> Value {
@@ -346,6 +417,46 @@ pub fn render_repo_map(root: &Path, filter: Option<&str>, max_entries: usize) ->
     Ok(out)
 }
 
+/// Renders exact numbered source slices for matching AST symbols.
+pub fn render_symbol_slices(
+    root: &Path,
+    symbol: &str,
+    file_hint: Option<&str>,
+    max_matches: usize,
+) -> Result<String> {
+    let index = RepoIndex::build(root)?;
+    let matches = if let Some(hint) = file_hint {
+        index.find_symbol(symbol, Some(hint))
+    } else if symbol.contains("::") {
+        let q = index.find_qualified_symbol(symbol);
+        if q.is_empty() {
+            index.find_symbol(symbol, None)
+        } else {
+            q
+        }
+    } else {
+        index.find_symbol(symbol, None)
+    };
+    if matches.is_empty() {
+        return Ok(format!("(symbol `{symbol}` not found in indexed AST)\n"));
+    }
+
+    let mut out = String::new();
+    for entry in matches.iter().take(max_matches) {
+        let slice = read_symbol_source(&index.root, entry)?;
+        out.push_str(&slice);
+        out.push('\n');
+    }
+    if matches.len() > max_matches {
+        let _ = writeln!(
+            out,
+            "... ({} more matches omitted)",
+            matches.len() - max_matches
+        );
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,7 +474,9 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"verify_docs\",\"arguments\":{}}}\n",
-            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"check_claims\",\"arguments\":{\"text\":\"Checked `fn missing`\"}}}\n"
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"check_claims\",\"arguments\":{\"text\":\"Checked `fn missing`\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"read_symbol\",\"arguments\":{\"symbol\":\"ping\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"receipt_status\",\"arguments\":{}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
         let mut out = Vec::new();
@@ -374,10 +487,17 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(lines.len(), 4); // notification produced no response
+        assert_eq!(lines.len(), 6); // notification produced no response
         assert_eq!(lines[0]["result"]["serverInfo"]["name"], "ctxproof");
-        assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 7);
         assert_eq!(lines[2]["result"]["isError"], false);
         assert_eq!(lines[3]["result"]["isError"], true);
+        assert!(
+            lines[4]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("pub fn ping()")
+        );
+        assert_eq!(lines[5]["result"]["isError"], false);
     }
 }

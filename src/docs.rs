@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::manifests::ProjectManifests;
 use crate::model::{CheckKind, Diagnostic, Report, Severity};
-use crate::symbols::{Lang, PathLookup, RepoIndex, clean_rel_str};
+use crate::symbols::{Lang, PathLookup, RepoIndex, SymbolEntry, clean_rel_str};
 
 const DOC_EXACT_NAMES: &[&str] = &[
     "AGENTS.md",
@@ -60,14 +61,35 @@ const STANDARD_CARGO_SUBCOMMANDS: &[&str] = &[
 ];
 
 const CODE_DOC_EXTENSIONS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "toml", "json", "yml", "yaml", "md", "sh",
-    "ps1", "lock",
+    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "c", "h", "cpp", "cc", "hpp", "toml",
+    "json", "yml", "yaml", "md", "sh", "ps1", "lock",
 ];
 
 /// Runs context-rot checks across AI instruction files, skills, and README docs.
 #[must_use]
 pub fn check_docs(index: &RepoIndex, manifests: &ProjectManifests) -> Report {
-    let doc_files = discover_doc_files(index);
+    check_docs_with_config(index, manifests, &Config::default(), false)
+}
+
+/// Runs context-rot checks with `.ctxproof.toml` config and optional `--fix` updates
+/// for shifted symbol line links (`[sym](file.rs#L10-L20)`).
+#[must_use]
+pub fn check_docs_with_config(
+    index: &RepoIndex,
+    manifests: &ProjectManifests,
+    config: &Config,
+    fix: bool,
+) -> Report {
+    let mut doc_files = discover_doc_files(index);
+    for extra in &config.extra_docs {
+        if let Some(clean) = clean_rel_str(extra)
+            && !doc_files.contains(&clean)
+            && matches!(index.path_exists(&clean), PathLookup::File { .. })
+        {
+            doc_files.push(clean);
+        }
+    }
+    doc_files.retain(|f| !config.is_path_ignored(f));
     let mut diagnostics = Vec::new();
     let mut seen = BTreeSet::new();
     let mut js_mentions: BTreeMap<String, Vec<(PathBuf, usize)>> = BTreeMap::new();
@@ -80,21 +102,46 @@ pub fn check_docs(index: &RepoIndex, manifests: &ProjectManifests) -> Report {
         let doc_path = PathBuf::from(doc_rel);
         let doc_parent = doc_path.parent().unwrap_or_else(|| Path::new(""));
         let is_instruction_file = is_ai_instruction_file(doc_rel);
+        let mut line_rewrites: Vec<(String, String)> = Vec::new();
 
         let parsed = scan_markdown(&content);
         for link in parsed.links {
+            if let Some((old_target, new_target, fix_msg)) = fix
+                .then(|| try_fix_symbol_link(index, doc_parent, &link))
+                .flatten()
+            {
+                line_rewrites.push((old_target, new_target));
+                diagnostics.push(Diagnostic::new(
+                    Severity::Info,
+                    CheckKind::BrokenLineRange,
+                    Some(doc_path.clone()),
+                    Some(link.line),
+                    fix_msg,
+                ));
+                continue;
+            }
             validate_path_ref(
                 index,
-                &doc_path,
-                doc_parent,
+                config,
+                (&doc_path, doc_parent),
                 link.line,
                 &link.target,
                 &mut diagnostics,
                 &mut seen,
             );
         }
+        if !line_rewrites.is_empty() {
+            let mut updated = content.clone();
+            for (old, new) in line_rewrites {
+                updated = updated.replacen(&format!("({old})"), &format!("({new})"), 1);
+            }
+            let _ = std::fs::write(&abs, updated);
+        }
         for span in parsed.backticks {
             if looks_like_command(&span.text) {
+                if config.is_command_ignored(&span.text) {
+                    continue;
+                }
                 validate_command_tokens(
                     manifests,
                     &doc_path,
@@ -113,8 +160,8 @@ pub fn check_docs(index: &RepoIndex, manifests: &ProjectManifests) -> Report {
             if looks_like_repo_path(&span.text) {
                 validate_path_ref(
                     index,
-                    &doc_path,
-                    doc_parent,
+                    config,
+                    (&doc_path, doc_parent),
                     span.line,
                     &span.text,
                     &mut diagnostics,
@@ -123,6 +170,9 @@ pub fn check_docs(index: &RepoIndex, manifests: &ProjectManifests) -> Report {
             }
         }
         for cmd in parsed.shell_commands {
+            if config.is_command_ignored(&cmd.text) {
+                continue;
+            }
             validate_command_tokens(
                 manifests,
                 &doc_path,
@@ -136,6 +186,7 @@ pub fn check_docs(index: &RepoIndex, manifests: &ProjectManifests) -> Report {
     }
 
     check_js_manager_conflicts(manifests, &js_mentions, &mut diagnostics);
+    let diagnostics = config.filter_diagnostics(diagnostics);
 
     let errors = diagnostics
         .iter()
@@ -199,6 +250,7 @@ struct LineText {
 #[derive(Debug)]
 struct MarkdownLink {
     line: usize,
+    label: String,
     target: String,
 }
 
@@ -284,8 +336,13 @@ fn extract_links_in_line(line: &str, line_no: usize, out: &mut Vec<MarkdownLink>
                     && !target.contains("://")
                     && !target.starts_with("mailto:")
                 {
+                    let label = line[..i]
+                        .rfind('[')
+                        .map(|open| line[open + 1..i].trim().to_owned())
+                        .unwrap_or_default();
                     out.push(MarkdownLink {
                         line: line_no,
+                        label,
                         target: target.trim_matches(|c| c == '<' || c == '>').to_owned(),
                     });
                 }
@@ -430,21 +487,78 @@ fn looks_like_repo_path(s: &str) -> bool {
     false
 }
 
+fn try_fix_symbol_link(
+    index: &RepoIndex,
+    doc_parent: &Path,
+    link: &MarkdownLink,
+) -> Option<(String, String, String)> {
+    let (raw_path, Some((old_start, old_end))) = split_path_and_line_range(&link.target) else {
+        return None;
+    };
+    let clean_label = link.label.trim().trim_matches('`');
+    let sym_query = clean_label
+        .split_once(' ')
+        .and_then(|(kw, rest)| {
+            matches!(
+                kw,
+                "fn" | "struct" | "enum" | "trait" | "def" | "class" | "func" | "type"
+            )
+            .then_some(rest.trim())
+        })
+        .unwrap_or(clean_label)
+        .trim_end_matches("()");
+    if sym_query.is_empty() || sym_query.contains(' ') {
+        return None;
+    }
+
+    let rel_from_doc = (!doc_parent.as_os_str().is_empty())
+        .then(|| clean_rel_str(&format!("{}/{raw_path}", doc_parent.display())))
+        .flatten();
+    let target_file = rel_from_doc
+        .as_deref()
+        .and_then(|r| index.resolve_file(r))
+        .or_else(|| index.resolve_file(raw_path))?;
+    let target_norm = target_file.path.to_string_lossy().replace('\\', "/");
+
+    let matches: Vec<&SymbolEntry> = index.find_symbol(sym_query, Some(&target_norm));
+    if matches.len() != 1 {
+        return None;
+    }
+    let sym = matches[0];
+    if sym.start_line == old_start && sym.end_line == old_end {
+        return None;
+    }
+    let new_target = if old_start == old_end && sym.start_line == sym.end_line {
+        format!("{raw_path}#L{}", sym.start_line)
+    } else {
+        format!("{raw_path}#L{}-L{}", sym.start_line, sym.end_line)
+    };
+    if new_target == link.target {
+        return None;
+    }
+    let msg = format!(
+        "fixed shifted line range `{}` -> `{}` for symbol `{sym_query}`",
+        link.target, new_target
+    );
+    Some((link.target.clone(), new_target, msg))
+}
+
 fn validate_path_ref(
     index: &RepoIndex,
-    doc_path: &Path,
-    doc_parent: &Path,
+    config: &Config,
+    doc: (&Path, &Path),
     line_no: usize,
     raw_target: &str,
     diagnostics: &mut Vec<Diagnostic>,
     seen: &mut BTreeSet<(PathBuf, usize, String)>,
 ) {
+    let (doc_path, doc_parent) = doc;
     if has_placeholder_tokens(raw_target) {
         return;
     }
     let (raw_path, line_range) = split_path_and_line_range(raw_target);
     let raw_trimmed = raw_path.trim_end_matches('/');
-    if raw_trimmed.is_empty() {
+    if raw_trimmed.is_empty() || config.is_path_ignored(raw_trimmed) {
         return;
     }
 
@@ -519,12 +633,14 @@ fn looks_like_symbol_decl(s: &str) -> bool {
     let trimmed = s.trim();
     for prefix in [
         "fn ",
+        "func ",
         "struct ",
         "enum ",
         "trait ",
         "def ",
         "class ",
         "interface ",
+        "namespace ",
     ] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let ident = rest.split(['(', '<', '{', ':', ' ']).next().unwrap_or("");
@@ -553,9 +669,19 @@ fn validate_symbol_decl(
         return;
     }
     let has_lang = match kw {
-        "fn" | "struct" | "enum" | "trait" => {
-            index.files.values().any(|f| f.language == Some(Lang::Rust))
-        }
+        "fn" | "trait" => index.files.values().any(|f| f.language == Some(Lang::Rust)),
+        "func" => index.files.values().any(|f| f.language == Some(Lang::Go)),
+        "namespace" => index.files.values().any(|f| f.language == Some(Lang::Cpp)),
+        "struct" => index
+            .files
+            .values()
+            .any(|f| matches!(f.language, Some(Lang::Rust | Lang::C | Lang::Cpp))),
+        "enum" => index.files.values().any(|f| {
+            matches!(
+                f.language,
+                Some(Lang::Rust | Lang::C | Lang::Cpp | Lang::TypeScript | Lang::Tsx)
+            )
+        }),
         "def" => index
             .files
             .values()
@@ -567,7 +693,7 @@ fn validate_symbol_decl(
         "class" => index.files.values().any(|f| {
             matches!(
                 f.language,
-                Some(Lang::Python | Lang::TypeScript | Lang::Tsx | Lang::JavaScript)
+                Some(Lang::Python | Lang::TypeScript | Lang::Tsx | Lang::JavaScript | Lang::Cpp)
             )
         }),
         _ => false,
@@ -881,5 +1007,29 @@ mod tests {
                 .iter()
                 .any(|d| d.kind == CheckKind::ConflictingRule)
         );
+    }
+
+    #[test]
+    fn fixes_shifted_symbol_line_links() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "// header\n// moved down\npub fn real_fn() {\n    let _ = 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "Entry point: [`real_fn`](src/lib.rs#L1-L2).\n",
+        )
+        .unwrap();
+
+        let index = RepoIndex::build(dir.path()).unwrap();
+        let manifests = ProjectManifests::discover(&index);
+        let fixed = check_docs_with_config(&index, &manifests, &Config::default(), true);
+        assert!(fixed.ok, "{}", fixed.render_text());
+
+        let updated = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(updated.contains("src/lib.rs#L3-L5"), "{updated}");
     }
 }

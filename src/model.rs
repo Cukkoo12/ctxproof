@@ -124,4 +124,64 @@ impl Report {
         }
         out
     }
+
+    /// Renders diagnostics as SARIF 2.1.0 JSON for GitHub Code Scanning / CI integrations.
+    #[must_use]
+    pub fn render_sarif(&self) -> serde_json::Value {
+        let results: Vec<serde_json::Value> = self
+            .diagnostics
+            .iter()
+            .map(|d| {
+                let level = match d.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warning",
+                    Severity::Info => "note",
+                };
+                let rule_id = crate::config::check_kind_slug(d.kind);
+                let mut msg = d.message.clone();
+                if let Some(hint) = &d.suggestion {
+                    msg.push_str(&format!(" (hint: {hint})"));
+                }
+                let locations: Vec<serde_json::Value> = d
+                    .file
+                    .as_ref()
+                    .map(|f| {
+                        let uri = f.to_string_lossy().replace('\\', "/");
+                        let mut phys = serde_json::json!({
+                            "artifactLocation": { "uri": uri }
+                        });
+                        if let Some(line) = d.line {
+                            phys["region"] = serde_json::json!({ "startLine": line });
+                        }
+                        vec![serde_json::json!({ "physicalLocation": phys })]
+                    })
+                    .unwrap_or_default();
+
+                let mut entry = serde_json::json!({
+                    "ruleId": rule_id,
+                    "level": level,
+                    "message": { "text": msg },
+                });
+                if !locations.is_empty() {
+                    entry["locations"] = serde_json::Value::Array(locations);
+                }
+                entry
+            })
+            .collect();
+
+        serde_json::json!({
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {
+                    "driver": {
+                        "name": "ctxproof",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "informationUri": "https://github.com/Cukkoo12/ctxproof"
+                    }
+                },
+                "results": results
+            }]
+        })
+    }
 }
