@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -240,11 +240,21 @@ fn call_tool(default_root: &Path, id: Value, params: &Value) -> RpcResponse {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let root = args
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(Path::new)
-        .unwrap_or(default_root);
+    let resolved_root = match resolve_mcp_root(default_root, &args) {
+        Ok(r) => r,
+        Err(e) => {
+            return RpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(json!({
+                    "content": [{ "type": "text", "text": format!("error: {e}") }],
+                    "isError": true
+                })),
+                error: None,
+            };
+        }
+    };
+    let root = resolved_root.as_path();
 
     let result = match name {
         "verify_docs" => {
@@ -357,6 +367,43 @@ fn call_tool(default_root: &Path, id: Value, params: &Value) -> RpcResponse {
             error: None,
         },
     }
+}
+
+fn resolve_mcp_root(default_root: &Path, args: &Value) -> Result<PathBuf> {
+    if let Some(explicit) = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(PathBuf::from(explicit));
+    }
+    let canon = std::fs::canonicalize(default_root).unwrap_or_else(|_| default_root.to_path_buf());
+    let is_fs_root = canon.parent().is_none();
+    let is_home = ["USERPROFILE", "HOME"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .any(|home| home == canon);
+    let has_marker = [
+        ".git",
+        ".ctxproof.toml",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "AGENTS.md",
+        "CLAUDE.md",
+    ]
+    .iter()
+    .any(|m| canon.join(m).exists());
+    if (is_fs_root || is_home) && !has_marker {
+        anyhow::bail!(
+            "MCP server cwd ({}) is a home/root directory rather than a repository; pass explicit `root` in arguments",
+            canon.display()
+        );
+    }
+    Ok(canon)
 }
 
 fn run_docs(root: &Path, fix: bool) -> Result<Report> {
@@ -499,5 +546,19 @@ mod tests {
                 .contains("pub fn ping()")
         );
         assert_eq!(lines[5]["result"]["isError"], false);
+    }
+
+    #[test]
+    fn refuses_implicit_filesystem_root_cwd() {
+        let fs_root = if cfg!(windows) {
+            Path::new("C:\\")
+        } else {
+            Path::new("/")
+        };
+        let err = resolve_mcp_root(fs_root, &json!({})).unwrap_err();
+        assert!(err.to_string().contains("home/root directory"));
+
+        let explicit = resolve_mcp_root(fs_root, &json!({ "root": "d:\\Ai\\ctxproof" })).unwrap();
+        assert_eq!(explicit, PathBuf::from("d:\\Ai\\ctxproof"));
     }
 }
