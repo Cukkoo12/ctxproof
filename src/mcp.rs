@@ -198,7 +198,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "repo_map",
-            "description": "Return a compact AST symbol map (functions, structs, classes, line ranges across Rust/Python/TS/JS/Go/C/C++) to save agent tokens.",
+            "description": "Return a compact AST symbol map (functions, structs, classes, line ranges across Rust/Python/TS/JS/Go/C/C++/C#) to save agent tokens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -474,7 +474,7 @@ pub fn render_symbol_slices(
     let index = RepoIndex::build(root)?;
     let matches = if let Some(hint) = file_hint {
         index.find_symbol(symbol, Some(hint))
-    } else if symbol.contains("::") {
+    } else if symbol.contains("::") || symbol.contains('.') {
         let q = index.find_qualified_symbol(symbol);
         if q.is_empty() {
             index.find_symbol(symbol, None)

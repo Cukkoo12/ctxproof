@@ -61,8 +61,9 @@ const STANDARD_CARGO_SUBCOMMANDS: &[&str] = &[
 ];
 
 const CODE_DOC_EXTENSIONS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "c", "h", "cpp", "cc", "hpp", "toml",
-    "json", "yml", "yaml", "md", "sh", "ps1", "lock",
+    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "c", "h", "cpp", "cc", "hpp", "cs",
+    "csproj", "sln", "asmdef", "unity", "prefab", "shader", "hlsl", "cginc", "toml", "json", "yml",
+    "yaml", "md", "sh", "ps1", "lock",
 ];
 
 /// Runs context-rot checks across AI instruction files, skills, and README docs.
@@ -462,6 +463,12 @@ fn looks_like_repo_path(s: &str) -> bool {
                 | ".cache"
                 | "out"
                 | "tmp"
+                | "Library"
+                | "Temp"
+                | "Logs"
+                | "Obj"
+                | "obj"
+                | "bin"
         );
         if looks_like_mime || is_runtime_dir {
             return false;
@@ -474,6 +481,7 @@ fn looks_like_repo_path(s: &str) -> bool {
                 | "tests"
                 | "docs"
                 | "scripts"
+                | "Assets"
                 | ".github"
                 | ".cursor"
                 | ".agents"
@@ -640,6 +648,7 @@ fn looks_like_symbol_decl(s: &str) -> bool {
         "def ",
         "class ",
         "interface ",
+        "record ",
         "namespace ",
     ] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
@@ -671,29 +680,49 @@ fn validate_symbol_decl(
     let has_lang = match kw {
         "fn" | "trait" => index.files.values().any(|f| f.language == Some(Lang::Rust)),
         "func" => index.files.values().any(|f| f.language == Some(Lang::Go)),
-        "namespace" => index.files.values().any(|f| f.language == Some(Lang::Cpp)),
-        "struct" => index
+        "record" => index
             .files
             .values()
-            .any(|f| matches!(f.language, Some(Lang::Rust | Lang::C | Lang::Cpp))),
+            .any(|f| f.language == Some(Lang::CSharp)),
+        "namespace" => index
+            .files
+            .values()
+            .any(|f| matches!(f.language, Some(Lang::Cpp | Lang::CSharp))),
+        "struct" => index.files.values().any(|f| {
+            matches!(
+                f.language,
+                Some(Lang::Rust | Lang::C | Lang::Cpp | Lang::CSharp)
+            )
+        }),
         "enum" => index.files.values().any(|f| {
             matches!(
                 f.language,
-                Some(Lang::Rust | Lang::C | Lang::Cpp | Lang::TypeScript | Lang::Tsx)
+                Some(
+                    Lang::Rust | Lang::C | Lang::Cpp | Lang::CSharp | Lang::TypeScript | Lang::Tsx
+                )
             )
         }),
         "def" => index
             .files
             .values()
             .any(|f| f.language == Some(Lang::Python)),
-        "interface" => index
-            .files
-            .values()
-            .any(|f| matches!(f.language, Some(Lang::TypeScript | Lang::Tsx))),
+        "interface" => index.files.values().any(|f| {
+            matches!(
+                f.language,
+                Some(Lang::TypeScript | Lang::Tsx | Lang::CSharp)
+            )
+        }),
         "class" => index.files.values().any(|f| {
             matches!(
                 f.language,
-                Some(Lang::Python | Lang::TypeScript | Lang::Tsx | Lang::JavaScript | Lang::Cpp)
+                Some(
+                    Lang::Python
+                        | Lang::TypeScript
+                        | Lang::Tsx
+                        | Lang::JavaScript
+                        | Lang::Cpp
+                        | Lang::CSharp
+                )
             )
         }),
         _ => false,

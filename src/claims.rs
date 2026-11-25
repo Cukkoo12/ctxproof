@@ -184,6 +184,32 @@ fn check_backtick_claims(
             continue;
         }
 
+        // Check `Type.Method` (C#, Go, Python, TS/JS) when the receiver/type exists in this repo.
+        if !token.contains(' ')
+            && !token.contains('/')
+            && !token.contains("::")
+            && !looks_like_file_token(token)
+            && let Some((ty, _)) = token.split_once('.')
+            && is_plain_ident(ty)
+            && !index.find_symbol(ty, None).is_empty()
+        {
+            let clean_sym = token.split(['(', '<']).next().unwrap_or(token).trim();
+            if index.find_qualified_symbol(clean_sym).is_empty()
+                && seen.insert(format!("dot:{clean_sym}"))
+            {
+                diagnostics.push(Diagnostic::new(
+                    Severity::Error,
+                    CheckKind::UnverifiedClaim,
+                    None,
+                    Some(line_no),
+                    format!(
+                        "type `{ty}` exists in repo, but qualified symbol `{clean_sym}` was not found"
+                    ),
+                ));
+            }
+            continue;
+        }
+
         // Check `func()` when the same line cites exactly one source file in this repo.
         if line_files.len() == 1
             && let Some(fn_name) = token.strip_suffix("()")
@@ -465,5 +491,36 @@ mod tests {
         let bogus = "Called `logging::else_where`.";
         let bogus_report = check_claims(&index, bogus).unwrap();
         assert!(!bogus_report.ok);
+    }
+
+    #[test]
+    fn validates_unity_csharp_dot_qualified_symbols_and_skips_library_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Assets/Scripts")).unwrap();
+        std::fs::create_dir_all(dir.path().join("ProjectSettings")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Library/PackageCache")).unwrap();
+        std::fs::write(
+            dir.path().join("Library/PackageCache/Generated.cs"),
+            "public class CachedShouldNotIndex {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Assets/Scripts/PlayerController.cs"),
+            "namespace Game {\n    public class PlayerController {\n        public void Move() {}\n    }\n}\n",
+        )
+        .unwrap();
+
+        let index = RepoIndex::build(dir.path()).unwrap();
+        assert!(index.find_symbol("CachedShouldNotIndex", None).is_empty());
+
+        let valid = check_claims(
+            &index,
+            "Updated `PlayerController.Move` in `Assets/Scripts/PlayerController.cs#L2-L4`.",
+        )
+        .unwrap();
+        assert!(valid.ok, "{}", valid.render_text());
+
+        let invalid = check_claims(&index, "Called `PlayerController.Fly`.").unwrap();
+        assert!(!invalid.ok);
     }
 }

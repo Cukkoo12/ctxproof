@@ -18,6 +18,7 @@ pub enum Lang {
     Go,
     C,
     Cpp,
+    CSharp,
 }
 
 impl Lang {
@@ -34,6 +35,7 @@ impl Lang {
             "go" => Some(Self::Go),
             "c" | "h" => Some(Self::C),
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
+            "cs" => Some(Self::CSharp),
             _ => None,
         }
     }
@@ -48,8 +50,22 @@ impl Lang {
             Self::Go => tree_sitter_go::LANGUAGE.into(),
             Self::C => tree_sitter_c::LANGUAGE.into(),
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         }
     }
+}
+
+/// True when `root` looks like a Unity project (`Assets/` + `ProjectSettings/`).
+#[must_use]
+pub fn is_unity_root(root: &Path) -> bool {
+    root.join("Assets").is_dir() && root.join("ProjectSettings").is_dir()
+}
+
+/// Shared directory-filter predicate for repo walking and tree fingerprinting.
+#[must_use]
+pub fn should_skip_dir(name: &str, unity_project: bool) -> bool {
+    matches!(name, ".git" | ".ctxproof" | "target" | "node_modules")
+        || (unity_project && matches!(name, "Library" | "Temp" | "Logs" | "Obj"))
 }
 
 /// Extracted code symbol entry from an AST.
@@ -97,17 +113,15 @@ impl RepoIndex {
         let mut symbols_by_name: BTreeMap<String, Vec<SymbolEntry>> = BTreeMap::new();
         let mut symbols_by_file: BTreeMap<String, Vec<SymbolEntry>> = BTreeMap::new();
 
+        let unity_project = is_unity_root(&root);
         let walker = WalkBuilder::new(&root)
             .hidden(false)
             .git_ignore(true)
             .git_global(false)
             .git_exclude(true)
-            .filter_entry(|entry| {
+            .filter_entry(move |entry| {
                 let name = entry.file_name().to_string_lossy();
-                !matches!(
-                    name.as_ref(),
-                    ".git" | ".ctxproof" | "target" | "node_modules"
-                )
+                !should_skip_dir(name.as_ref(), unity_project)
             })
             .build();
 
@@ -269,32 +283,42 @@ impl RepoIndex {
             .unwrap_or_default()
     }
 
-    /// Looks up a Rust/module-qualified symbol (`Type::method` or `mod::sub::sym`),
-    /// resolving file module paths (`src/a/b.rs` -> `a::b`) alongside AST scopes.
+    /// Looks up a qualified symbol (`Type::method`, `mod::sub::sym`, or `Namespace.Type.Method`),
+    /// resolving Rust file module paths alongside `.`- and `::`-scoped AST entries.
     #[must_use]
     pub fn find_qualified_symbol(&self, query: &str) -> Vec<&SymbolEntry> {
         if let Some(direct) = self.symbols_by_name.get(query) {
             return direct.iter().collect();
         }
-        let Some((_, leaf)) = query.rsplit_once("::") else {
-            return Vec::new();
-        };
-        let Some(candidates) = self.symbols_by_name.get(leaf) else {
-            return Vec::new();
-        };
-        let suffix = format!("::{query}");
-        candidates
-            .iter()
-            .filter(|sym| {
-                let mod_path = rust_file_module_path(&sym.file);
-                let full_qual = if mod_path.is_empty() {
-                    sym.qualified.clone()
-                } else {
-                    format!("{mod_path}::{}", sym.qualified)
-                };
-                full_qual == query || full_qual.ends_with(&suffix)
-            })
-            .collect()
+        if let Some((_, leaf)) = query.rsplit_once("::") {
+            let Some(candidates) = self.symbols_by_name.get(leaf) else {
+                return Vec::new();
+            };
+            let suffix = format!("::{query}");
+            return candidates
+                .iter()
+                .filter(|sym| {
+                    let mod_path = rust_file_module_path(&sym.file);
+                    let full_qual = if mod_path.is_empty() {
+                        sym.qualified.clone()
+                    } else {
+                        format!("{mod_path}::{}", sym.qualified)
+                    };
+                    full_qual == query || full_qual.ends_with(&suffix)
+                })
+                .collect();
+        }
+        if let Some((_, leaf)) = query.rsplit_once('.') {
+            let Some(candidates) = self.symbols_by_name.get(leaf) else {
+                return Vec::new();
+            };
+            let suffix = format!(".{query}");
+            return candidates
+                .iter()
+                .filter(|sym| sym.qualified == query || sym.qualified.ends_with(&suffix))
+                .collect();
+        }
+        Vec::new()
     }
 }
 
@@ -462,7 +486,8 @@ fn walk_node(
                 | Lang::Tsx
                 | Lang::JavaScript
                 | Lang::Go
-                | Lang::C => ".",
+                | Lang::C
+                | Lang::CSharp => ".",
             };
             let qualified = if lang == Lang::Go
                 && kind == "method_declaration"
@@ -490,6 +515,27 @@ fn walk_node(
                 scope.pop();
                 return;
             }
+        }
+    }
+
+    // C# file-scoped namespaces (`namespace Foo.Bar;`) apply to following sibling types.
+    if lang == Lang::CSharp
+        && kind == "file_scoped_namespace_declaration"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(ns_text) = name_node.utf8_text(src)
+    {
+        let ns = ns_text.trim().to_owned();
+        if !ns.is_empty() {
+            out.push(SymbolEntry {
+                name: ns.clone(),
+                qualified: ns.clone(),
+                kind: "namespace",
+                file: file.to_path_buf(),
+                start_line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+            });
+            scope.push(ns);
+            return;
         }
     }
 
@@ -527,10 +573,12 @@ fn walk_children(
     scope: &mut Vec<String>,
     out: &mut Vec<SymbolEntry>,
 ) {
+    let saved_depth = scope.len();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_node(child, lang, file, src, scope, out);
     }
+    scope.truncate(saved_depth);
 }
 
 fn classify_node<'a>(
@@ -602,6 +650,18 @@ fn classify_node<'a>(
                 Some(("class", node.child_by_field_name("name")?, true))
             }
             "namespace_definition" => Some(("namespace", node.child_by_field_name("name")?, true)),
+            _ => None,
+        },
+        Lang::CSharp => match kind {
+            "class_declaration" => Some(("class", node.child_by_field_name("name")?, true)),
+            "struct_declaration" => Some(("struct", node.child_by_field_name("name")?, true)),
+            "interface_declaration" => Some(("interface", node.child_by_field_name("name")?, true)),
+            "enum_declaration" => Some(("enum", node.child_by_field_name("name")?, true)),
+            "record_declaration" => Some(("record", node.child_by_field_name("name")?, true)),
+            "method_declaration" => Some(("method", node.child_by_field_name("name")?, false)),
+            "constructor_declaration" => Some(("ctor", node.child_by_field_name("name")?, false)),
+            "property_declaration" => Some(("prop", node.child_by_field_name("name")?, false)),
+            "namespace_declaration" => Some(("namespace", node.child_by_field_name("name")?, true)),
             _ => None,
         },
     }
@@ -747,6 +807,51 @@ pub fn helper() {}
         };
         let slice = read_symbol_source(dir.path(), &helper_at_2).unwrap();
         assert!(slice.contains("   2: func Helper() {}"));
+    }
+
+    #[test]
+    fn extracts_csharp_and_unity_symbols_with_namespaces() {
+        let mut parser = Parser::new();
+        let cs = extract_symbols(
+            &mut parser,
+            Lang::CSharp,
+            Path::new("Assets/Scripts/PlayerController.cs"),
+            r#"
+namespace Game.Player {
+    public class PlayerController {
+        public float Speed { get; set; }
+        public PlayerController() {}
+        public void Move() {}
+    }
+    public interface IMovable {}
+}
+"#,
+        );
+        assert!(
+            cs.iter()
+                .any(|s| s.name == "PlayerController" && s.kind == "class")
+        );
+        assert!(
+            cs.iter()
+                .any(|s| s.qualified == "Game.Player.PlayerController.Move" && s.kind == "method")
+        );
+        assert!(
+            cs.iter()
+                .any(|s| s.qualified == "Game.Player.PlayerController.Speed" && s.kind == "prop")
+        );
+        assert!(cs.iter().any(|s| s.qualified == "Game.Player.IMovable"));
+
+        let file_scoped = extract_symbols(
+            &mut parser,
+            Lang::CSharp,
+            Path::new("Assets/Scripts/Enemy.cs"),
+            "namespace Game.AI;\npublic class Enemy {\n    public void Patrol() {}\n}\n",
+        );
+        assert!(
+            file_scoped
+                .iter()
+                .any(|s| s.qualified == "Game.AI.Enemy.Patrol")
+        );
     }
 
     #[test]

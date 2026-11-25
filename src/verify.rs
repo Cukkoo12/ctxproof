@@ -8,7 +8,7 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{CheckKind, Diagnostic, Report, Severity};
-use crate::symbols::normalize_rel;
+use crate::symbols::{is_unity_root, normalize_rel, should_skip_dir};
 
 const RECEIPT_DIR: &str = ".ctxproof";
 const RECEIPT_FILE: &str = "receipts.json";
@@ -35,17 +35,15 @@ pub fn compute_tree_fingerprint(root: &Path) -> Result<String> {
     let canon_root = std::fs::canonicalize(root)
         .with_context(|| format!("canonicalizing {}", root.display()))?;
     let mut paths = Vec::new();
+    let unity_project = is_unity_root(&canon_root);
     let walker = WalkBuilder::new(&canon_root)
         .hidden(false)
         .git_ignore(true)
         .git_global(false)
         .git_exclude(true)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();
-            !matches!(
-                name.as_ref(),
-                ".git" | ".ctxproof" | "target" | "node_modules"
-            )
+            !should_skip_dir(name.as_ref(), unity_project)
         })
         .build();
 
