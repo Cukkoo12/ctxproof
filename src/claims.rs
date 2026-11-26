@@ -6,7 +6,9 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::docs::split_path_and_line_range;
 use crate::model::{CheckKind, Diagnostic, Report, Severity};
-use crate::symbols::{PathLookup, RepoIndex, clean_rel_str};
+use crate::symbols::{
+    PathLookup, RepoIndex, clean_rel_str, extract_decl_ident, strip_godot_res_prefix,
+};
 use crate::verify::inspect_receipts;
 
 /// Verifies draft PR text, commit messages, or AI final answers against the live repo:
@@ -146,14 +148,14 @@ fn check_backtick_claims(
     }
 
     for token in &backticks {
-        if let Some((kw_ident, ident)) = parse_decl_ident(token) {
+        if let Some((_, ident)) = extract_decl_ident(token) {
             if index.find_symbol(ident, None).is_empty() && seen.insert(format!("sym:{token}")) {
                 diagnostics.push(Diagnostic::new(
                     Severity::Error,
                     CheckKind::UnverifiedClaim,
                     None,
                     Some(line_no),
-                    format!("claimed declaration `{kw_ident}` does not exist in indexed AST"),
+                    format!("claimed declaration `{token}` does not exist in indexed AST"),
                 ));
             }
             continue;
@@ -277,7 +279,7 @@ fn check_claimed_receipts(
 }
 
 fn to_repo_relative(index: &RepoIndex, target: &str) -> Option<String> {
-    let trimmed = target.trim();
+    let trimmed = strip_godot_res_prefix(target.trim(), index.projects.godot);
     if trimmed.is_empty()
         || trimmed.starts_with('#')
         || trimmed.starts_with("http://")
@@ -371,31 +373,6 @@ fn validate_repo_target(
             }
         }
     }
-}
-
-fn parse_decl_ident(token: &str) -> Option<(&str, &str)> {
-    for kw in [
-        "fn ",
-        "func ",
-        "struct ",
-        "enum ",
-        "trait ",
-        "def ",
-        "class ",
-        "namespace ",
-    ] {
-        if let Some(rest) = token.strip_prefix(kw) {
-            let ident = rest
-                .split(['(', '<', '{', ':', ' '])
-                .next()
-                .unwrap_or("")
-                .trim();
-            if is_plain_ident(ident) {
-                return Some((token, ident));
-            }
-        }
-    }
-    None
 }
 
 fn is_plain_ident(s: &str) -> bool {
@@ -522,5 +499,46 @@ mod tests {
 
         let invalid = check_claims(&index, "Called `PlayerController.Fly`.").unwrap();
         assert!(!invalid.ok);
+    }
+
+    #[test]
+    fn validates_godot_gdscript_symbols_res_paths_and_skips_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("project.godot"), "[application]\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".godot/imported")).unwrap();
+        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        std::fs::create_dir_all(dir.path().join("scenes")).unwrap();
+        std::fs::write(
+            dir.path().join(".godot/imported/Hidden.gd"),
+            "class_name HiddenGodotCache\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("scripts/kapi.gd"),
+            "class_name Kapi\nsignal toggled(state)\nfunc open_door() -> void:\n\tpass\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("scenes/kapi.tscn"), "[gd_scene format=3]\n").unwrap();
+
+        let index = RepoIndex::build(dir.path()).unwrap();
+        assert!(index.find_symbol("HiddenGodotCache", None).is_empty());
+
+        let valid = check_claims(
+            &index,
+            "Updated `Kapi.open_door` and `signal toggled` in `res://scripts/kapi.gd#L1-L4` and [scene](res://scenes/kapi.tscn).",
+        )
+        .unwrap();
+        assert!(valid.ok, "{}", valid.render_text());
+
+        let invalid = check_claims(
+            &index,
+            "Updated `Kapi.fly` and `signal bogus_sig` in `res://scripts/missing.gd`.",
+        )
+        .unwrap();
+        assert!(!invalid.ok);
+        let rendered = invalid.render_text();
+        assert!(rendered.contains("Kapi.fly"));
+        assert!(rendered.contains("bogus_sig"));
+        assert!(rendered.contains("scripts/missing.gd"));
     }
 }

@@ -19,6 +19,7 @@ pub enum Lang {
     C,
     Cpp,
     CSharp,
+    GdScript,
 }
 
 impl Lang {
@@ -36,6 +37,7 @@ impl Lang {
             "c" | "h" => Some(Self::C),
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
             "cs" => Some(Self::CSharp),
+            "gd" => Some(Self::GdScript),
             _ => None,
         }
     }
@@ -51,6 +53,25 @@ impl Lang {
             Self::C => tree_sitter_c::LANGUAGE.into(),
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Self::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
+        }
+    }
+}
+
+/// Engine/project directory layout hints for filtering generated caches.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProjectKindFlags {
+    pub unity: bool,
+    pub godot: bool,
+}
+
+impl ProjectKindFlags {
+    /// Detects Unity (`Assets/` + `ProjectSettings/`) and Godot (`project.godot`) roots.
+    #[must_use]
+    pub fn detect(root: &Path) -> Self {
+        Self {
+            unity: is_unity_root(root),
+            godot: is_godot_root(root),
         }
     }
 }
@@ -61,11 +82,59 @@ pub fn is_unity_root(root: &Path) -> bool {
     root.join("Assets").is_dir() && root.join("ProjectSettings").is_dir()
 }
 
+/// True when `root` looks like a Godot project (`project.godot`).
+#[must_use]
+pub fn is_godot_root(root: &Path) -> bool {
+    root.join("project.godot").is_file()
+}
+
+/// Strips Godot's `res://` resource prefix when inspecting a Godot repository.
+#[must_use]
+pub fn strip_godot_res_prefix(raw: &str, is_godot: bool) -> &str {
+    if is_godot {
+        raw.strip_prefix("res://").unwrap_or(raw)
+    } else {
+        raw
+    }
+}
+
+/// Parses backticked declaration prefixes like `fn foo` or `signal opened` into `(keyword, ident)`.
+#[must_use]
+pub fn extract_decl_ident(raw: &str) -> Option<(&'static str, &str)> {
+    let trimmed = raw.trim();
+    for (prefix, kw) in [
+        ("fn ", "fn"),
+        ("func ", "func"),
+        ("struct ", "struct"),
+        ("enum ", "enum"),
+        ("trait ", "trait"),
+        ("def ", "def"),
+        ("class ", "class"),
+        ("interface ", "interface"),
+        ("record ", "record"),
+        ("namespace ", "namespace"),
+        ("signal ", "signal"),
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let ident = rest
+                .split(['(', '<', '{', ':', ' '])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !ident.is_empty() && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Some((kw, ident));
+            }
+        }
+    }
+    None
+}
+
 /// Shared directory-filter predicate for repo walking and tree fingerprinting.
 #[must_use]
-pub fn should_skip_dir(name: &str, unity_project: bool) -> bool {
+pub fn should_skip_dir(name: &str, flags: ProjectKindFlags) -> bool {
     matches!(name, ".git" | ".ctxproof" | "target" | "node_modules")
-        || (unity_project && matches!(name, "Library" | "Temp" | "Logs" | "Obj"))
+        || (flags.unity && matches!(name, "Library" | "Temp" | "Logs" | "Obj"))
+        || (flags.godot && matches!(name, ".godot" | ".import" | ".mono"))
 }
 
 /// Extracted code symbol entry from an AST.
@@ -91,6 +160,7 @@ pub struct FileMeta {
 #[derive(Debug, Clone)]
 pub struct RepoIndex {
     pub root: PathBuf,
+    pub projects: ProjectKindFlags,
     pub files: BTreeMap<String, FileMeta>,
     pub dirs: BTreeSet<String>,
     pub symbols_by_name: BTreeMap<String, Vec<SymbolEntry>>,
@@ -113,7 +183,7 @@ impl RepoIndex {
         let mut symbols_by_name: BTreeMap<String, Vec<SymbolEntry>> = BTreeMap::new();
         let mut symbols_by_file: BTreeMap<String, Vec<SymbolEntry>> = BTreeMap::new();
 
-        let unity_project = is_unity_root(&root);
+        let projects = ProjectKindFlags::detect(&root);
         let walker = WalkBuilder::new(&root)
             .hidden(false)
             .git_ignore(true)
@@ -121,7 +191,7 @@ impl RepoIndex {
             .git_exclude(true)
             .filter_entry(move |entry| {
                 let name = entry.file_name().to_string_lossy();
-                !should_skip_dir(name.as_ref(), unity_project)
+                !should_skip_dir(name.as_ref(), projects)
             })
             .build();
 
@@ -188,6 +258,7 @@ impl RepoIndex {
 
         Ok(Self {
             root,
+            projects,
             files,
             dirs,
             symbols_by_name,
@@ -455,6 +526,46 @@ pub fn extract_symbols(
     out
 }
 
+fn scope_separator(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Rust | Lang::Cpp => "::",
+        Lang::Python
+        | Lang::TypeScript
+        | Lang::Tsx
+        | Lang::JavaScript
+        | Lang::Go
+        | Lang::C
+        | Lang::CSharp
+        | Lang::GdScript => ".",
+    }
+}
+
+fn format_qualified(scope: &[String], sep: &str, name: &str) -> String {
+    if scope.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}{sep}{name}", scope.join(sep))
+    }
+}
+
+fn push_symbol_entry(
+    out: &mut Vec<SymbolEntry>,
+    file: &Path,
+    kind: &'static str,
+    name: String,
+    qualified: String,
+    node: Node<'_>,
+) {
+    out.push(SymbolEntry {
+        name,
+        qualified,
+        kind,
+        file: file.to_path_buf(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    });
+}
+
 fn walk_node(
     node: Node<'_>,
     lang: Lang,
@@ -464,6 +575,7 @@ fn walk_node(
     out: &mut Vec<SymbolEntry>,
 ) {
     let kind = node.kind();
+    let sep = scope_separator(lang);
     if let Some((sym_kind, name_node, pushes_scope)) = classify_node(node, lang, src)
         && let Ok(name_text) = name_node.utf8_text(src)
     {
@@ -479,16 +591,6 @@ fn walk_node(
             clean_name.to_owned()
         };
         if !name.is_empty() {
-            let sep = match lang {
-                Lang::Rust | Lang::Cpp => "::",
-                Lang::Python
-                | Lang::TypeScript
-                | Lang::Tsx
-                | Lang::JavaScript
-                | Lang::Go
-                | Lang::C
-                | Lang::CSharp => ".",
-            };
             let qualified = if lang == Lang::Go
                 && kind == "method_declaration"
                 && let Some(recv) = go_receiver_type(node, src)
@@ -496,19 +598,10 @@ fn walk_node(
                 format!("{recv}.{name}")
             } else if matches!(lang, Lang::Cpp) && clean_name.contains("::") && scope.is_empty() {
                 clean_name.to_owned()
-            } else if scope.is_empty() {
-                name.clone()
             } else {
-                format!("{}{sep}{name}", scope.join(sep))
+                format_qualified(scope, sep, &name)
             };
-            out.push(SymbolEntry {
-                name: name.clone(),
-                qualified,
-                kind: sym_kind,
-                file: file.to_path_buf(),
-                start_line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
-            });
+            push_symbol_entry(out, file, sym_kind, name.clone(), qualified, node);
             if pushes_scope {
                 scope.push(name);
                 walk_children(node, lang, file, src, scope, out);
@@ -518,25 +611,31 @@ fn walk_node(
         }
     }
 
-    // C# file-scoped namespaces (`namespace Foo.Bar;`) apply to following sibling types.
-    if lang == Lang::CSharp
-        && kind == "file_scoped_namespace_declaration"
+    // File-level scoping statements (`namespace Foo.Bar;` in C#, `class_name Door` in GDScript)
+    // apply to subsequent sibling declarations until enclosing `walk_children` restores depth.
+    let file_scope_kind = match (lang, kind) {
+        (Lang::CSharp, "file_scoped_namespace_declaration") => Some("namespace"),
+        (Lang::GdScript, "class_name_statement") => Some("class"),
+        _ => None,
+    };
+    if let Some(sym_kind) = file_scope_kind
         && let Some(name_node) = node.child_by_field_name("name")
-        && let Ok(ns_text) = name_node.utf8_text(src)
+        && let Ok(scope_text) = name_node.utf8_text(src)
     {
-        let ns = ns_text.trim().to_owned();
-        if !ns.is_empty() {
-            out.push(SymbolEntry {
-                name: ns.clone(),
-                qualified: ns.clone(),
-                kind: "namespace",
-                file: file.to_path_buf(),
-                start_line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
-            });
-            scope.push(ns);
+        let label = scope_text.trim().to_owned();
+        if !label.is_empty() {
+            push_symbol_entry(out, file, sym_kind, label.clone(), label.clone(), node);
+            scope.push(label);
             return;
         }
+    }
+
+    // GDScript `func _init(...)` parses as `constructor_definition` with no `name` field.
+    if lang == Lang::GdScript && kind == "constructor_definition" {
+        let qualified = format_qualified(scope, sep, "_init");
+        push_symbol_entry(out, file, "fn", "_init".to_owned(), qualified, node);
+        walk_children(node, lang, file, src, scope, out);
+        return;
     }
 
     // Rust `impl` blocks push their target type onto the scope stack so methods resolve as `Type::method`.
@@ -662,6 +761,20 @@ fn classify_node<'a>(
             "constructor_declaration" => Some(("ctor", node.child_by_field_name("name")?, false)),
             "property_declaration" => Some(("prop", node.child_by_field_name("name")?, false)),
             "namespace_declaration" => Some(("namespace", node.child_by_field_name("name")?, true)),
+            _ => None,
+        },
+        Lang::GdScript => match kind {
+            "class_definition" => Some(("class", node.child_by_field_name("name")?, true)),
+            "function_definition" => Some(("fn", node.child_by_field_name("name")?, false)),
+            "signal_statement" => Some(("signal", node.child_by_field_name("name")?, false)),
+            "enum_definition" => Some(("enum", node.child_by_field_name("name")?, false)),
+            "const_statement"
+                if node
+                    .parent()
+                    .is_some_and(|p| matches!(p.kind(), "source" | "class_body")) =>
+            {
+                Some(("const", node.child_by_field_name("name")?, false))
+            }
             _ => None,
         },
     }
@@ -852,6 +965,87 @@ namespace Game.Player {
                 .iter()
                 .any(|s| s.qualified == "Game.AI.Enemy.Patrol")
         );
+    }
+
+    #[test]
+    fn extracts_godot_gdscript_symbols_and_skips_cache() {
+        let mut parser = Parser::new();
+        let gd = extract_symbols(
+            &mut parser,
+            Lang::GdScript,
+            Path::new("scripts/door.gd"),
+            r#"class_name Door
+extends Node2D
+
+signal opened(actor)
+enum State { CLOSED, OPEN }
+const MAX_ANGLE := 90
+
+func _init() -> void:
+	pass
+
+static func can_open() -> bool:
+	return true
+
+func open(actor) -> void:
+	const LOCAL_TMP := 1
+	opened.emit(actor)
+
+class Lock:
+	func unlock() -> void:
+		pass
+"#,
+        );
+        assert!(gd.iter().any(|s| s.name == "Door" && s.kind == "class"));
+        assert!(
+            gd.iter()
+                .any(|s| s.qualified == "Door.opened" && s.kind == "signal")
+        );
+        assert!(
+            gd.iter()
+                .any(|s| s.qualified == "Door.State" && s.kind == "enum")
+        );
+        assert!(
+            gd.iter()
+                .any(|s| s.qualified == "Door.MAX_ANGLE" && s.kind == "const")
+        );
+        assert!(
+            gd.iter()
+                .any(|s| s.qualified == "Door._init" && s.kind == "fn")
+        );
+        assert!(
+            gd.iter()
+                .any(|s| s.qualified == "Door.can_open" && s.kind == "fn")
+        );
+        assert!(
+            gd.iter()
+                .any(|s| s.qualified == "Door.open" && s.kind == "fn")
+        );
+        assert!(
+            gd.iter()
+                .any(|s| s.qualified == "Door.Lock.unlock" && s.kind == "fn")
+        );
+        assert!(!gd.iter().any(|s| s.name == "LOCAL_TMP"));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("project.godot"), "[application]\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".godot/shader_cache")).unwrap();
+        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        std::fs::write(
+            dir.path().join(".godot/shader_cache/Cached.gd"),
+            "class_name CachedHidden\nfunc skip_me() -> void:\n\tpass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("scripts/door.gd"),
+            "class_name Door\nfunc open() -> void:\n\tpass\n",
+        )
+        .unwrap();
+
+        let index = RepoIndex::build(dir.path()).unwrap();
+        assert!(index.projects.godot);
+        assert!(index.find_symbol("CachedHidden", None).is_empty());
+        assert!(!index.find_qualified_symbol("Door.open").is_empty());
     }
 
     #[test]

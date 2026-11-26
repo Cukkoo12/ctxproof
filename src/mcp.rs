@@ -198,7 +198,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "repo_map",
-            "description": "Return a compact AST symbol map (functions, structs, classes, line ranges across Rust/Python/TS/JS/Go/C/C++/C#) to save agent tokens.",
+            "description": "Return a compact AST symbol map (functions, structs, classes, signals, line ranges across Rust/Python/TS/JS/Go/C/C++/C#/GDScript) to save agent tokens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -392,6 +392,7 @@ fn resolve_mcp_root(default_root: &Path, args: &Value) -> Result<PathBuf> {
         "package.json",
         "pyproject.toml",
         "go.mod",
+        "project.godot",
         "AGENTS.md",
         "CLAUDE.md",
     ]

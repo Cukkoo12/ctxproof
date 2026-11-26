@@ -116,19 +116,19 @@ codex mcp add ctxproof -- ctxproof mcp
 
 ---
 
-## Features (v0.3.0)
+## Features (v0.4.0)
 
 - **`ctxproof init`** — Writes a starter `.ctxproof.toml` configuration file and prints MCP client setup instructions.
 - **`ctxproof docs [--fix]`** — Scans `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `RULES.md`, `CONTRIBUTING.md`, `README.md`, `docs/**/*.md`, `.cursorrules`, `.cursor/rules/**`, `.agents/**`, and `**/SKILL.md` (plus `extra_docs` in `.ctxproof.toml`) for:
-  - Missing relative paths and out-of-range `#Lstart-Lend` line links (`--fix` updates shifted `#L` links whose label uniquely matches an AST symbol in the target file)
+  - Missing relative paths (including `res://` resource paths in Godot repos) and out-of-range `#Lstart-Lend` line links (`--fix` updates shifted `#L` links whose label uniquely matches an AST symbol in the target file)
   - Invalid `cargo -p` / `--features` / cargo aliases, `package.json` scripts, `Makefile` targets, and `justfile` recipes
-  - Documented symbol declarations (`fn`, `func`, `struct`, `enum`, `trait`, `def`, `class`, `interface`, `record`, `namespace`) verified with `tree-sitter` across **Rust, Python, TypeScript/TSX, JavaScript, Go, C, C++, and C# (including Unity `.cs` projects under the Assets directory, skipping `Library/`, `Temp/`, `Logs/`, and `Obj/`)**
+  - Documented symbol declarations (`fn`, `func`, `struct`, `enum`, `trait`, `def`, `class`, `interface`, `record`, `namespace`, `signal`) verified with `tree-sitter` across **Rust, Python, TypeScript/TSX, JavaScript, Go, C, C++, C# (including Unity `.cs` projects, skipping `Library/`, `Temp/`, `Logs/`, `Obj/`), and GDScript (Godot `.gd` / `project.godot`, skipping `.godot/`, `.import/`, `.mono/`)**
   - Cross-file contradictions between AI instruction files and repo lockfiles (`npm` vs `pnpm` vs `yarn` vs `bun`)
 - **`ctxproof diff`** — Audits staged + unstaged `git diff` and untracked files **strictly on edited lines**:
   - Diff-scoped `rustfmt --check` and Python `ruff format --diff` ignore untouched pre-existing formatting drift outside edited hunks (and report transparently if a formatter binary is unavailable)
   - Flags leftover debug statements (`dbg!`, `console.log`, `breakpoint()`, `pdb.set_trace()`, `TODO(agent)`) in added source files and credential/key patterns in any added lines
 - **`ctxproof verify -- <cmd>`** & **`ctxproof status`** — Runs checks, distills noisy compiler/test output down to actionable failures, and records a `blake3` tree-fingerprint receipt under `.ctxproof/receipts.json`. Any edit invalidates matching receipts as **`STALE`**.
-- **`ctxproof check-claims`** — Verifies draft PR descriptions or AI responses against live repo paths (`file://` links included), `#L` ranges, `tree-sitter` AST symbols (`Type::method`, `module::symbol`, and `Type.Method`), and fresh passing test receipts.
+- **`ctxproof check-claims`** — Verifies draft PR descriptions or AI responses against live repo paths (`file://` and Godot `res://` links included), `#L` ranges, `tree-sitter` AST symbols (`Type::method`, `module::symbol`, `Type.Method`), and fresh passing test receipts.
 - **`ctxproof map [--symbol <name> --source]`** — Prints a token-compact AST symbol map or reads only the numbered AST source slice for a requested symbol.
 - **`ctxproof check`** — Runs `docs`, `diff`, and stale-receipt checks in one pass.
 - **`ctxproof mcp`** — Exposes 7 tools over MCP `stdio` JSON-RPC 2.0: `verify_docs`, `verify_diff`, `run_verified`, `check_claims`, `repo_map`, `read_symbol`, and `receipt_status`.

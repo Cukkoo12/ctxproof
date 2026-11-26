@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::manifests::ProjectManifests;
 use crate::model::{CheckKind, Diagnostic, Report, Severity};
-use crate::symbols::{Lang, PathLookup, RepoIndex, SymbolEntry, clean_rel_str};
+use crate::symbols::{
+    Lang, PathLookup, RepoIndex, SymbolEntry, clean_rel_str, extract_decl_ident,
+    strip_godot_res_prefix,
+};
 
 const DOC_EXACT_NAMES: &[&str] = &[
     "AGENTS.md",
@@ -61,9 +64,43 @@ const STANDARD_CARGO_SUBCOMMANDS: &[&str] = &[
 ];
 
 const CODE_DOC_EXTENSIONS: &[&str] = &[
-    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "c", "h", "cpp", "cc", "hpp", "cs",
-    "csproj", "sln", "asmdef", "unity", "prefab", "shader", "hlsl", "cginc", "toml", "json", "yml",
-    "yaml", "md", "sh", "ps1", "lock",
+    "rs",
+    "py",
+    "ts",
+    "tsx",
+    "js",
+    "jsx",
+    "mjs",
+    "cjs",
+    "go",
+    "c",
+    "h",
+    "cpp",
+    "cc",
+    "hpp",
+    "cs",
+    "csproj",
+    "sln",
+    "asmdef",
+    "unity",
+    "prefab",
+    "shader",
+    "hlsl",
+    "cginc",
+    "gd",
+    "tscn",
+    "tres",
+    "gdshader",
+    "gdshaderinc",
+    "godot",
+    "toml",
+    "json",
+    "yml",
+    "yaml",
+    "md",
+    "sh",
+    "ps1",
+    "lock",
 ];
 
 /// Runs context-rot checks across AI instruction files, skills, and README docs.
@@ -154,11 +191,11 @@ pub fn check_docs_with_config(
                 );
                 continue;
             }
-            if looks_like_symbol_decl(&span.text) {
+            if extract_decl_ident(&span.text).is_some() {
                 validate_symbol_decl(index, &doc_path, span.line, &span.text, &mut diagnostics);
                 continue;
             }
-            if looks_like_repo_path(&span.text) {
+            if looks_like_repo_path(&span.text, index.projects.godot) {
                 validate_path_ref(
                     index,
                     config,
@@ -426,7 +463,8 @@ fn has_placeholder_tokens(s: &str) -> bool {
         || s.contains("...")
 }
 
-fn looks_like_repo_path(s: &str) -> bool {
+fn looks_like_repo_path(s: &str, is_godot: bool) -> bool {
+    let s = strip_godot_res_prefix(s, is_godot);
     if s.len() < 3
         || s.len() > 140
         || s.contains(' ')
@@ -456,6 +494,9 @@ fn looks_like_repo_path(s: &str) -> bool {
                 | "node_modules"
                 | ".ctxproof"
                 | ".git"
+                | ".godot"
+                | ".import"
+                | ".mono"
                 | "dist"
                 | "build"
                 | ".venv"
@@ -500,7 +541,9 @@ fn try_fix_symbol_link(
     doc_parent: &Path,
     link: &MarkdownLink,
 ) -> Option<(String, String, String)> {
-    let (raw_path, Some((old_start, old_end))) = split_path_and_line_range(&link.target) else {
+    let has_res_prefix = index.projects.godot && link.target.starts_with("res://");
+    let stripped_target = strip_godot_res_prefix(&link.target, index.projects.godot);
+    let (raw_path, Some((old_start, old_end))) = split_path_and_line_range(stripped_target) else {
         return None;
     };
     let clean_label = link.label.trim().trim_matches('`');
@@ -509,7 +552,7 @@ fn try_fix_symbol_link(
         .and_then(|(kw, rest)| {
             matches!(
                 kw,
-                "fn" | "struct" | "enum" | "trait" | "def" | "class" | "func" | "type"
+                "fn" | "struct" | "enum" | "trait" | "def" | "class" | "func" | "type" | "signal"
             )
             .then_some(rest.trim())
         })
@@ -519,7 +562,7 @@ fn try_fix_symbol_link(
         return None;
     }
 
-    let rel_from_doc = (!doc_parent.as_os_str().is_empty())
+    let rel_from_doc = (!has_res_prefix && !doc_parent.as_os_str().is_empty())
         .then(|| clean_rel_str(&format!("{}/{raw_path}", doc_parent.display())))
         .flatten();
     let target_file = rel_from_doc
@@ -536,10 +579,14 @@ fn try_fix_symbol_link(
     if sym.start_line == old_start && sym.end_line == old_end {
         return None;
     }
+    let res_prefix = if has_res_prefix { "res://" } else { "" };
     let new_target = if old_start == old_end && sym.start_line == sym.end_line {
-        format!("{raw_path}#L{}", sym.start_line)
+        format!("{res_prefix}{raw_path}#L{}", sym.start_line)
     } else {
-        format!("{raw_path}#L{}-L{}", sym.start_line, sym.end_line)
+        format!(
+            "{res_prefix}{raw_path}#L{}-L{}",
+            sym.start_line, sym.end_line
+        )
     };
     if new_target == link.target {
         return None;
@@ -561,17 +608,19 @@ fn validate_path_ref(
     seen: &mut BTreeSet<(PathBuf, usize, String)>,
 ) {
     let (doc_path, doc_parent) = doc;
-    if has_placeholder_tokens(raw_target) {
+    let has_res_prefix = index.projects.godot && raw_target.starts_with("res://");
+    let effective_target = strip_godot_res_prefix(raw_target, index.projects.godot);
+    if has_placeholder_tokens(effective_target) {
         return;
     }
-    let (raw_path, line_range) = split_path_and_line_range(raw_target);
+    let (raw_path, line_range) = split_path_and_line_range(effective_target);
     let raw_trimmed = raw_path.trim_end_matches('/');
     if raw_trimmed.is_empty() || config.is_path_ignored(raw_trimmed) {
         return;
     }
 
-    // Try resolving relative to the doc's folder first, then from the repo root.
-    let rel_from_doc = if doc_parent.as_os_str().is_empty() {
+    // Try resolving relative to the doc's folder first (unless Godot `res://`), then from repo root.
+    let rel_from_doc = if has_res_prefix || doc_parent.as_os_str().is_empty() {
         None
     } else {
         clean_rel_str(&format!("{}/{raw_trimmed}", doc_parent.display()))
@@ -637,29 +686,6 @@ fn validate_path_ref(
     }
 }
 
-fn looks_like_symbol_decl(s: &str) -> bool {
-    let trimmed = s.trim();
-    for prefix in [
-        "fn ",
-        "func ",
-        "struct ",
-        "enum ",
-        "trait ",
-        "def ",
-        "class ",
-        "interface ",
-        "record ",
-        "namespace ",
-    ] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let ident = rest.split(['(', '<', '{', ':', ' ']).next().unwrap_or("");
-            return !ident.is_empty()
-                && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        }
-    }
-    false
-}
-
 fn validate_symbol_decl(
     index: &RepoIndex,
     doc_path: &Path,
@@ -668,18 +694,22 @@ fn validate_symbol_decl(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let trimmed = raw.trim();
-    let (kw, rest) = trimmed.split_once(' ').unwrap_or(("", ""));
-    let ident = rest
-        .split(['(', '<', '{', ':', ' '])
-        .next()
-        .unwrap_or("")
-        .trim();
-    if ident.is_empty() || has_placeholder_tokens(ident) {
+    let Some((kw, ident)) = extract_decl_ident(trimmed) else {
+        return;
+    };
+    if has_placeholder_tokens(ident) {
         return;
     }
     let has_lang = match kw {
         "fn" | "trait" => index.files.values().any(|f| f.language == Some(Lang::Rust)),
-        "func" => index.files.values().any(|f| f.language == Some(Lang::Go)),
+        "func" => index
+            .files
+            .values()
+            .any(|f| matches!(f.language, Some(Lang::Go | Lang::GdScript))),
+        "signal" => index
+            .files
+            .values()
+            .any(|f| f.language == Some(Lang::GdScript)),
         "record" => index
             .files
             .values()
@@ -698,7 +728,13 @@ fn validate_symbol_decl(
             matches!(
                 f.language,
                 Some(
-                    Lang::Rust | Lang::C | Lang::Cpp | Lang::CSharp | Lang::TypeScript | Lang::Tsx
+                    Lang::Rust
+                        | Lang::C
+                        | Lang::Cpp
+                        | Lang::CSharp
+                        | Lang::TypeScript
+                        | Lang::Tsx
+                        | Lang::GdScript
                 )
             )
         }),
@@ -722,6 +758,7 @@ fn validate_symbol_decl(
                         | Lang::JavaScript
                         | Lang::Cpp
                         | Lang::CSharp
+                        | Lang::GdScript
                 )
             )
         }),

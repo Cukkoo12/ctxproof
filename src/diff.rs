@@ -272,6 +272,7 @@ fn is_source_code_file(rel: &str) -> bool {
                     | "h"
                     | "hpp"
                     | "cs"
+                    | "gd"
                     | "java"
             )
         })
