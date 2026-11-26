@@ -110,16 +110,22 @@ fn run() -> Result<bool> {
     match cli.command {
         Commands::Init { force } => {
             if Config::write_starter(&cli.root, force)? {
-                println!(
-                    "Created `{}`.\n\nTo add ctxproof as an MCP server:\n{{\n  \"mcpServers\": {{\n    \"ctxproof\": {{ \"command\": \"ctxproof\", \"args\": [\"mcp\"] }}\n  }}\n}}",
-                    cli.root.join(".ctxproof.toml").display()
-                );
+                println!("Created `{}`.", cli.root.join(".ctxproof.toml").display());
             } else {
                 println!(
                     "`{}` already exists (pass `--force` to overwrite).",
                     cli.root.join(".ctxproof.toml").display()
                 );
             }
+            if Config::ensure_gitignore_entry(&cli.root)? {
+                println!(
+                    "Added `.ctxproof/` to `{}`.",
+                    cli.root.join(".gitignore").display()
+                );
+            }
+            println!(
+                "\n1) Register MCP:\n  claude mcp add -s user ctxproof -- ctxproof mcp\n  codex mcp add ctxproof -- ctxproof mcp\n\nOr add to mcp_config.json:\n{{\n  \"mcpServers\": {{\n    \"ctxproof\": {{ \"command\": \"ctxproof\", \"args\": [\"mcp\"] }}\n  }}\n}}\n\n2) Paste into CLAUDE.md / AGENTS.md so agents actively use ctxproof:\n- Before reading large source files, use `ctxproof` `repo_map` + `read_symbol`.\n- Run tests/builds via `run_verified` to record freshness receipts.\n- Before replying, run `verify_diff` (and `verify_docs` / `check_claims` when citing files, symbols, or test results)."
+            );
             Ok(true)
         }
         Commands::Docs { fix } => {

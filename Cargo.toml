@@ -1,6 +1,6 @@
 [package]
 name = "ctxproof"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Context-rot, diff-hygiene, claim-verification, and MCP guardrail tool for AI coding agents"

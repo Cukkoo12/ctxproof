@@ -266,3 +266,22 @@ fn end_to_end_docs_diff_verify_claims_and_mcp() {
     assert!(stdout.contains("added_fn"));
     assert!(stdout.contains("STALE"));
 }
+
+#[test]
+fn init_writes_config_gitignore_and_prints_agent_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init"]);
+
+    let init_out = Command::new(bin())
+        .args(["--root", &root.to_string_lossy(), "init"])
+        .output()
+        .unwrap();
+    assert!(init_out.status.success());
+    let stdout = String::from_utf8_lossy(&init_out.stdout);
+    assert!(stdout.contains("repo_map"));
+    assert!(stdout.contains("run_verified"));
+    assert!(root.join(".ctxproof.toml").is_file());
+    let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+    assert!(gitignore.lines().any(|l| l.trim() == ".ctxproof/"));
+}

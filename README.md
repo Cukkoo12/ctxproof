@@ -67,9 +67,21 @@ $ ctxproof docs --fix
 
 ## Installation
 
-### Option 1: Prebuilt Binaries (Linux, macOS, Windows)
+### Option 1: One-Line Installer (Recommended — no Rust needed)
 
-Download the latest archive (`tar.gz` / `zip`) and `.sha256` checksum from [**GitHub Releases**](https://github.com/Cukkoo12/ctxproof/releases/latest) and place `ctxproof` (`ctxproof.exe` on Windows) on your `PATH`.
+**macOS (Apple Silicon) & Linux:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Cukkoo12/ctxproof/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/Cukkoo12/ctxproof/main/install.ps1 | iex
+```
+
+Both [install.sh](install.sh) and [install.ps1](install.ps1) verify the `.sha256` checksum from [**GitHub Releases**](https://github.com/Cukkoo12/ctxproof/releases/latest). Manual archives (`tar.gz` / `zip`) are also available on the releases page.
 
 ### Option 2: Install via Cargo
 
@@ -85,9 +97,9 @@ cargo install --path . --locked
 
 ---
 
-## One-Command MCP Integration
+## Two-Step Agent Integration (MCP + Rule)
 
-Register `ctxproof` as an MCP server so any coding agent can call `verify_docs`, `verify_diff`, `run_verified`, `check_claims`, `repo_map`, `read_symbol`, and `receipt_status`:
+### Step 1: Register the MCP server
 
 **Claude Code:**
 
@@ -114,11 +126,22 @@ codex mcp add ctxproof -- ctxproof mcp
 }
 ```
 
+### Step 2: Tell your agent to use it (`CLAUDE.md` / `AGENTS.md`)
+
+Coding agents keep using built-in `Read`/`Bash` unless instructed to prefer `ctxproof`. Add these 4 lines to your global or repo `CLAUDE.md` / `AGENTS.md` (also printed by `ctxproof init`):
+
+```markdown
+## Code inspection & verification (`ctxproof` MCP)
+- Before reading large source files, use `ctxproof` `repo_map` + `read_symbol`.
+- Run tests and builds through `run_verified` to record freshness receipts.
+- Before replying, run `verify_diff` (and `verify_docs` / `check_claims` when citing files, symbols, or test results).
+```
+
 ---
 
-## Features (v0.4.0)
+## Features (v0.4.1)
 
-- **`ctxproof init`** — Writes a starter `.ctxproof.toml` configuration file and prints MCP client setup instructions.
+- **`ctxproof init`** — Writes `.ctxproof.toml`, adds `.ctxproof/` to `.gitignore` in git repos, and prints ready-to-paste MCP + `CLAUDE.md`/`AGENTS.md` setup instructions.
 - **`ctxproof docs [--fix]`** — Scans `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `RULES.md`, `CONTRIBUTING.md`, `README.md`, `docs/**/*.md`, `.cursorrules`, `.cursor/rules/**`, `.agents/**`, and `**/SKILL.md` (plus `extra_docs` in `.ctxproof.toml`) for:
   - Missing relative paths (including `res://` resource paths in Godot repos) and out-of-range `#Lstart-Lend` line links (`--fix` updates shifted `#L` links whose label uniquely matches an AST symbol in the target file)
   - Invalid `cargo -p` / `--features` / cargo aliases, `package.json` scripts, `Makefile` targets, and `justfile` recipes

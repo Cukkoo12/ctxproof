@@ -65,6 +65,39 @@ impl Config {
         Ok(true)
     }
 
+    /// Ensures `.ctxproof/` is listed in `<root>/.gitignore` when inside a git repository.
+    /// Returns `Ok(true)` if modified or created, `Ok(false)` if already present or non-git.
+    pub fn ensure_gitignore_entry(root: &Path) -> Result<bool> {
+        let gitignore = root.join(".gitignore");
+        if !root.join(".git").exists() && !gitignore.is_file() {
+            return Ok(false);
+        }
+        let existing = if gitignore.is_file() {
+            std::fs::read_to_string(&gitignore)
+                .with_context(|| format!("reading {}", gitignore.display()))?
+        } else {
+            String::new()
+        };
+        let already_ignored = existing.lines().any(|line| {
+            matches!(
+                line.trim(),
+                ".ctxproof" | ".ctxproof/" | "/.ctxproof" | "/.ctxproof/"
+            )
+        });
+        if already_ignored {
+            return Ok(false);
+        }
+
+        let mut updated = existing;
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(".ctxproof/\n");
+        std::fs::write(&gitignore, updated)
+            .with_context(|| format!("writing {}", gitignore.display()))?;
+        Ok(true)
+    }
+
     /// True if `rel_path` matches any entry in `ignore_paths`.
     #[must_use]
     pub fn is_path_ignored(&self, rel_path: &str) -> bool {
@@ -215,5 +248,21 @@ disable_checks = ["leftover-debug"]
         let filtered = cfg.filter_diagnostics(diags);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].message, "kept");
+    }
+
+    #[test]
+    fn ensure_gitignore_entry_is_idempotent_and_skips_non_git() {
+        let non_git = tempfile::tempdir().unwrap();
+        assert!(!Config::ensure_gitignore_entry(non_git.path()).unwrap());
+        assert!(!non_git.path().join(".gitignore").exists());
+
+        let git_repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(git_repo.path().join(".git")).unwrap();
+        std::fs::write(git_repo.path().join(".gitignore"), "target/").unwrap();
+        assert!(Config::ensure_gitignore_entry(git_repo.path()).unwrap());
+        assert!(!Config::ensure_gitignore_entry(git_repo.path()).unwrap());
+
+        let text = std::fs::read_to_string(git_repo.path().join(".gitignore")).unwrap();
+        assert_eq!(text, "target/\n.ctxproof/\n");
     }
 }
