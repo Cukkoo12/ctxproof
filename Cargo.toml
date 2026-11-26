@@ -6,6 +6,8 @@ rust-version = "1.85"
 description = "Context-rot, diff-hygiene, claim-verification, and MCP guardrail tool for AI coding agents"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/Cukkoo12/ctxproof"
+homepage = "https://github.com/Cukkoo12/ctxproof"
 keywords = ["ai", "mcp", "cli", "tree-sitter", "verification"]
 categories = ["command-line-utilities", "development-tools"]
 

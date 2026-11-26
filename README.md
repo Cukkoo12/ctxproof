@@ -1,5 +1,9 @@
 # ctxproof
 
+[![CI](https://github.com/Cukkoo12/ctxproof/actions/workflows/ci.yml/badge.svg)](https://github.com/Cukkoo12/ctxproof/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Cukkoo12/ctxproof)](https://github.com/Cukkoo12/ctxproof/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Context-rot, diff-hygiene, claim-verification, and MCP guardrail tool for AI coding agents.**
 
 AI coding agents (`Claude Code`, `Codex`, `Cursor`, `Gemini CLI`, `Antigravity`, `OpenCode`) waste tokens and hallucinate when:
@@ -8,6 +12,109 @@ AI coding agents (`Claude Code`, `Codex`, `Cursor`, `Gemini CLI`, `Antigravity`,
 3. Final replies or PR bodies cite file paths, line ranges, AST symbols, or "all tests passed" claims that went stale after a final edit.
 
 `ctxproof` is a single fast Rust binary solving all three via CLI, SARIF 2.1.0 CI reporting, and an MCP (`stdio` JSON-RPC 2.0) server.
+
+---
+
+## See It In Action
+
+### 1. Catch hallucinated paths and AST symbols before replying
+
+```sh
+# 1) Record a cryptographic (blake3) receipt when checks pass
+$ ctxproof verify -- cargo test --locked
+[PASS] verify: `cargo test --locked` passed in 4850 ms (receipt recorded)
+
+# 2) Agent cites a nonexistent path or a hallucinated method on a real type
+$ ctxproof check-claims --text 'Updated `src/claims.rs` (`VerificationReceipt::bogus`) and `src/ghost.rs`.'
+[FAIL] check-claims: checked claims text (2 errors, 0 warnings)
+  - [error] claimed path `src/ghost.rs` does not exist in repository
+  - [error] type or module `VerificationReceipt` exists in repo, but qualified symbol `VerificationReceipt::bogus` was not found
+```
+
+### 2. Read only the target AST slice instead of burning tokens on full files
+
+**Before:** Agent reads the entire 305-line file to locate a single function.  
+**After:** Ask `ctxproof` for a compact AST map (`repo_map` / `read_symbol`):
+
+```sh
+$ ctxproof map --filter verify --max-entries 8
+src/lib.rs (9 lines):
+  L9-L9 mod verify
+src/verify.rs (305 lines):
+  L13-L13 const RECEIPT_DIR
+  L14-L14 const RECEIPT_FILE
+  L18-L26 struct VerificationReceipt
+  L29-L31 struct ReceiptStore
+  L34-L72 fn compute_tree_fingerprint
+  L76-L137 fn run_verified
+  L139-L158 fn spawn_command
+... truncated at 8 symbols
+
+$ ctxproof map --symbol run_verified --source
+// src/verify.rs (fn run_verified L76-L137)
+  76: pub fn run_verified(root: &Path, command: &[String]) -> Result<(Report, VerificationReceipt)> {
+  77:     anyhow::ensure!(!command.is_empty(), "command cannot be empty");
+```
+
+### 3. Detect & auto-fix drifted `#L` links in agent instruction files
+
+```sh
+$ ctxproof docs --fix
+[PASS] docs: scanned 1 doc/instruction files (0 errors, 0 warnings)
+```
+
+---
+
+## Installation
+
+### Option 1: Prebuilt Binaries (Linux, macOS, Windows)
+
+Download the latest archive (`tar.gz` / `zip`) and `.sha256` checksum from [**GitHub Releases**](https://github.com/Cukkoo12/ctxproof/releases/latest) and place `ctxproof` (`ctxproof.exe` on Windows) on your `PATH`.
+
+### Option 2: Install via Cargo
+
+```sh
+cargo install --git https://github.com/Cukkoo12/ctxproof --locked
+```
+
+Or from a local clone:
+
+```sh
+cargo install --path . --locked
+```
+
+---
+
+## One-Command MCP Integration
+
+Register `ctxproof` as an MCP server so any coding agent can call `verify_docs`, `verify_diff`, `run_verified`, `check_claims`, `repo_map`, `read_symbol`, and `receipt_status`:
+
+**Claude Code:**
+
+```sh
+claude mcp add -s user ctxproof -- ctxproof mcp
+```
+
+**Codex CLI:**
+
+```sh
+codex mcp add ctxproof -- ctxproof mcp
+```
+
+**Cursor / Antigravity / Gemini CLI / Generic MCP (`mcp_config.json`):**
+
+```json
+{
+  "mcpServers": {
+    "ctxproof": {
+      "command": "ctxproof",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+---
 
 ## Features (v0.3.0)
 
@@ -26,13 +133,9 @@ AI coding agents (`Claude Code`, `Codex`, `Cursor`, `Gemini CLI`, `Antigravity`,
 - **`ctxproof check`** — Runs `docs`, `diff`, and stale-receipt checks in one pass.
 - **`ctxproof mcp`** — Exposes 7 tools over MCP `stdio` JSON-RPC 2.0: `verify_docs`, `verify_diff`, `run_verified`, `check_claims`, `repo_map`, `read_symbol`, and `receipt_status`.
 
-## Installation & Quick Start
+---
 
-```sh
-cargo install --path .
-```
-
-Run checks in any repository:
+## Quick CLI Reference & CI Usage
 
 ```sh
 ctxproof init
@@ -63,21 +166,6 @@ rustfmt = true
 ruff = true
 ```
 
-## MCP Integration
-
-Add `ctxproof` to any MCP-compatible client (`Claude Code`, `Codex`, `Cursor`, `Antigravity`):
-
-```json
-{
-  "mcpServers": {
-    "ctxproof": {
-      "command": "ctxproof",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
 ## License
 
-MIT
+[MIT](LICENSE)
