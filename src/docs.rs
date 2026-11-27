@@ -5,8 +5,8 @@ use crate::config::Config;
 use crate::manifests::ProjectManifests;
 use crate::model::{CheckKind, Diagnostic, Report, Severity};
 use crate::symbols::{
-    Lang, PathLookup, RepoIndex, SymbolEntry, clean_rel_str, extract_decl_ident,
-    strip_godot_res_prefix,
+    Lang, PathLookup, RepoIndex, SymbolEntry, clean_rel_str, expand_pipe_ext_shorthand,
+    extract_decl_ident, strip_godot_res_prefix,
 };
 
 const DOC_EXACT_NAMES: &[&str] = &[
@@ -618,6 +618,14 @@ fn validate_path_ref(
     if raw_trimmed.is_empty() || config.is_path_ignored(raw_trimmed) {
         return;
     }
+    if line_range.is_none()
+        && let Some(expanded) = expand_pipe_ext_shorthand(raw_trimmed)
+    {
+        for single in expanded {
+            validate_path_ref(index, config, doc, line_no, &single, diagnostics, seen);
+        }
+        return;
+    }
 
     // Try resolving relative to the doc's folder first (unless Godot `res://`), then from repo root.
     let rel_from_doc = if has_res_prefix || doc_parent.as_os_str().is_empty() {
@@ -1097,5 +1105,32 @@ mod tests {
 
         let updated = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
         assert!(updated.contains("src/lib.rs#L3-L5"), "{updated}");
+    }
+
+    #[test]
+    fn expands_and_verifies_dual_extension_shorthand_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("scenes/ui")).unwrap();
+        std::fs::write(dir.path().join("scenes/ui/menu.tscn"), "[gd_scene]\n").unwrap();
+        std::fs::write(dir.path().join("scenes/ui/menu.gd"), "extends Control\n").unwrap();
+        std::fs::write(dir.path().join("scenes/ui/partial.tscn"), "[gd_scene]\n").unwrap();
+        std::fs::write(
+            dir.path().join("CLAUDE.md"),
+            "Menu: `scenes/ui/menu.tscn|.gd`.\nBroken pair: `scenes/ui/partial.tscn|.gd`.\n",
+        )
+        .unwrap();
+
+        let index = RepoIndex::build(dir.path()).unwrap();
+        let manifests = ProjectManifests::discover(&index);
+        let report = check_docs(&index, &manifests);
+        assert!(!report.ok);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert!(
+            report.diagnostics[0]
+                .message
+                .contains("scenes/ui/partial.gd"),
+            "{}",
+            report.render_text()
+        );
     }
 }

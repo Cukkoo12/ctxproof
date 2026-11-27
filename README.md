@@ -139,11 +139,11 @@ Coding agents keep using built-in `Read`/`Bash` unless instructed to prefer `ctx
 
 ---
 
-## Features (v0.4.1)
+## Features (v0.4.2)
 
 - **`ctxproof init`** — Writes `.ctxproof.toml`, adds `.ctxproof/` to `.gitignore` in git repos, and prints ready-to-paste MCP + `CLAUDE.md`/`AGENTS.md` setup instructions.
 - **`ctxproof docs [--fix]`** — Scans `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `RULES.md`, `CONTRIBUTING.md`, `README.md`, `docs/**/*.md`, `.cursorrules`, `.cursor/rules/**`, `.agents/**`, and `**/SKILL.md` (plus `extra_docs` in `.ctxproof.toml`) for:
-  - Missing relative paths (including `res://` resource paths in Godot repos) and out-of-range `#Lstart-Lend` line links (`--fix` updates shifted `#L` links whose label uniquely matches an AST symbol in the target file)
+  - Missing relative paths (including Godot `res://` links and multi-extension shorthand like `path/to/file.tscn|.gd`) and out-of-range `#Lstart-Lend` line links (`--fix` updates shifted `#L` links whose label uniquely matches an AST symbol in the target file)
   - Invalid `cargo -p` / `--features` / cargo aliases, `package.json` scripts, `Makefile` targets, and `justfile` recipes
   - Documented symbol declarations (`fn`, `func`, `struct`, `enum`, `trait`, `def`, `class`, `interface`, `record`, `namespace`, `signal`) verified with `tree-sitter` across **Rust, Python, TypeScript/TSX, JavaScript, Go, C, C++, C# (including Unity `.cs` projects, skipping `Library/`, `Temp/`, `Logs/`, `Obj/`), and GDScript (Godot `.gd` / `project.godot`, skipping `.godot/`, `.import/`, `.mono/`)**
   - Cross-file contradictions between AI instruction files and repo lockfiles (`npm` vs `pnpm` vs `yarn` vs `bun`)

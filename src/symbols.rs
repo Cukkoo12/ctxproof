@@ -98,6 +98,33 @@ pub fn strip_godot_res_prefix(raw: &str, is_godot: bool) -> &str {
     }
 }
 
+/// Expands dual/multi-extension shorthand paths such as `scenes/map.tscn|.gd`
+/// into `["scenes/map.tscn", "scenes/map.gd"]`.
+#[must_use]
+pub fn expand_pipe_ext_shorthand(raw: &str) -> Option<Vec<String>> {
+    if !raw.contains('|') || raw.contains(' ') {
+        return None;
+    }
+    let mut parts = raw.split('|');
+    let first = parts.next()?;
+    let (stem, first_ext) = first.rsplit_once('.')?;
+    if first_ext.contains('/') || first_ext.is_empty() {
+        return None;
+    }
+    let mut expanded = vec![first.to_owned()];
+    for extra in parts {
+        let ext = extra.strip_prefix('.')?;
+        if ext.is_empty()
+            || ext.contains('/')
+            || !ext.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return None;
+        }
+        expanded.push(format!("{stem}.{ext}"));
+    }
+    (expanded.len() > 1).then_some(expanded)
+}
+
 /// Parses backticked declaration prefixes like `fn foo` or `signal opened` into `(keyword, ident)`.
 #[must_use]
 pub fn extract_decl_ident(raw: &str) -> Option<(&'static str, &str)> {
@@ -1053,5 +1080,26 @@ class Lock:
         assert_eq!(clean_rel_str("../outside.rs"), None);
         assert_eq!(clean_rel_str("./src\\lib.rs"), Some("src/lib.rs".into()));
         assert_eq!(clean_rel_str("a/b/../c.rs"), Some("a/c.rs".into()));
+    }
+
+    #[test]
+    fn expands_dual_extension_shorthand_paths() {
+        assert_eq!(
+            expand_pipe_ext_shorthand("scenes/ui/map/map_screen.tscn|.gd"),
+            Some(vec![
+                "scenes/ui/map/map_screen.tscn".into(),
+                "scenes/ui/map/map_screen.gd".into(),
+            ])
+        );
+        assert_eq!(
+            expand_pipe_ext_shorthand("inc/foo.h|.c|.cpp"),
+            Some(vec![
+                "inc/foo.h".into(),
+                "inc/foo.c".into(),
+                "inc/foo.cpp".into(),
+            ])
+        );
+        assert_eq!(expand_pipe_ext_shorthand("cat.py|grep"), None);
+        assert_eq!(expand_pipe_ext_shorthand("scenes/map.gd"), None);
     }
 }

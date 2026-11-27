@@ -7,7 +7,8 @@ use crate::config::Config;
 use crate::docs::split_path_and_line_range;
 use crate::model::{CheckKind, Diagnostic, Report, Severity};
 use crate::symbols::{
-    PathLookup, RepoIndex, clean_rel_str, extract_decl_ident, strip_godot_res_prefix,
+    PathLookup, RepoIndex, clean_rel_str, expand_pipe_ext_shorthand, extract_decl_ident,
+    strip_godot_res_prefix,
 };
 use crate::verify::inspect_receipts;
 
@@ -324,6 +325,14 @@ fn validate_repo_target(
     seen: &mut BTreeSet<String>,
 ) {
     let (path_part, line_range) = split_path_and_line_range(rel);
+    if line_range.is_none()
+        && let Some(expanded) = expand_pipe_ext_shorthand(path_part)
+    {
+        for single in expanded {
+            validate_repo_target(index, line_no, &single, diagnostics, seen);
+        }
+        return;
+    }
     if clean_rel_str(path_part).is_none() {
         return;
     }
@@ -540,5 +549,13 @@ mod tests {
         assert!(rendered.contains("Kapi.fly"));
         assert!(rendered.contains("bogus_sig"));
         assert!(rendered.contains("scripts/missing.gd"));
+
+        std::fs::write(dir.path().join("scenes/kapi.gd"), "extends Node2D\n").unwrap();
+        let valid_pair = check_claims(
+            &RepoIndex::build(dir.path()).unwrap(),
+            "Updated `scenes/kapi.tscn|.gd` and `res://scenes/kapi.tscn|.gd`.",
+        )
+        .unwrap();
+        assert!(valid_pair.ok, "{}", valid_pair.render_text());
     }
 }
